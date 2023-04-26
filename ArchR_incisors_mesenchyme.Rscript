@@ -1,0 +1,240 @@
+library(ArchR)
+ArchR::installExtraPackages()
+library(Seurat)
+library(patchwork)
+library(chromVARmotifs)
+library(tidyverse)
+library(ggplot2)
+library(ggsignif)
+library(parallel)
+set.seed(123)
+library('GenomicFeatures')
+library('org.Mm.eg.db')
+addArchRGenome("mm10")
+addArchRThreads(12)
+orgdb<-org.Mm.eg.db
+project<-loadArchRProject('tooth')
+project<-subsetArchRProject(project, cells = (getCellNames(project)[which(project$Clusters == 'Mesenchyme')]), outputDirectory = 'tooth_mesenchyme', dropCells = TRUE, logFile = NULL, threads = getArchRThreads(), force = TRUE)
+
+project <- addIterativeLSI( ArchRProj = project, clusterParams = list(resolution = 0.2, sampleCells = 10000, n.start = 10), saveIterations = FALSE, useMatrix = "GeneExpressionMatrix", depthCol = "Gex_nUMI", varFeatures = 2500, firstSelection = "variable", binarize = FALSE, name = "LSI_RNA", force=TRUE, threads=1)
+
+project<-addIterativeLSI(ArchRProj=project, useMatrix="PeakMatrix", name="LSI_ATAC", force=TRUE, iterations=4, clusterParams=list(resolution=0.5, sampleCells=5000, n.start=10), depthCol="nFrags", saveIterations=FALSE, threads=1)
+saveArchRProject(project, overwrite = TRUE, load = TRUE, outputDirectory='tooth_mesenchyme')
+project <- addCombinedDims(project, reducedDims = c("LSI_ATAC", "LSI_RNA"), name =  "LSI_Combined")
+project <- addHarmony(ArchRProj = project, reducedDims = "LSI_Combined", name = "Harmony", groupBy = "Batch", force=TRUE, corCutOff=0.95)
+project <- addClusters(project, reducedDims = "Harmony", name = "Clusters", resolution = 0.2, force = TRUE)
+project <- addUMAP(project, reducedDims = "Harmony", name = "UMAP_Combined", minDist = 0.9, force = TRUE)
+
+
+#this step gets rid of cells with no assigned cluster
+clusters<-rownames(table(project$Clusters))
+data<-BiocGenerics::which(project$Clusters %in% clusters)
+data2<-project$cellNames[data]
+project<-subsetCells(ArchRProj = project, cellNames = data2)
+features<-getGenes(project)
+background<-features$symbol
+genes<-as.data.frame(background)
+genes2<-genes$background
+genes2<-gsub("NA_ENSG", "ENSG", genes2)
+p3<-plotEmbedding(ArchRProj=project, colorBy="cellColData", name="Clusters", embedding="UMAP_Combined")
+
+#now make umap of those clusters
+
+saveArchRProject(project, overwrite = TRUE, load = TRUE, outputDirectory='tooth_mesenchyme')
+
+project<-addImputeWeights(project, reducedDims='LSI_Combined')
+
+universe<-getFeatures(project)
+markersPeaks<-getMarkerFeatures(ArchRProj=project, useMatrix="GeneExpressionMatrix", groupBy="Clusters", bias=c('TSSEnrichment', 'log10(nFrags)'), threads=16)
+markerList <- getMarkers(markersPeaks, cutOff = "FDR <= 0.05 & Log2FC >= 0.5")
+standardmarkers<-NULL
+for (clustername in xxy){
+markers<-markerList[[clustername]]
+markers<-markers[order(markers$Log2FC),]
+standardmarkers<-rbind(standardmarkers, tail(markers,10))
+}
+heatmapGS <- markerHeatmap(seMarker = markersPeaks, cutOff = "FDR <= 0.01 & Log2FC >= 1.25", labelMarkers = standardmarkers$name, transpose = TRUE)
+pdf(file="tooth_mesenchyme_markergenes_heatmap.pdf", height=25, width=15)
+ComplexHeatmap::draw(heatmapGS, heatmap_legend_side = "bot", annotation_legend_side = "bot")
+dev.off()
+
+library(ggplot2)
+library(rGREAT)
+library(DOSE)
+library(multienrichjam)
+library(clusterProfiler)
+set.seed(123)
+data3<-NULL
+for (clustername in xxy){
+data<-BiocGenerics::which(project$Clusters %in% clustername)
+data2<-project$cellNames[data]
+data<-as.data.frame(data2)
+df <- markerList[[clustername]]
+df<-df[order(-df$Log2FC),5]
+value_bp <- enrichGO(gene = df, universe = universe, OrgDb = 'org.Mm.eg.db', keyType = 'SYMBOL', readable = F, ont = "BP", pvalueCutoff = 0.05, pAdjustMethod = "bonferroni")
+GO3<-simplify(value_bp, cutoff=0.75, by="qvalue")[]
+data$GO_Genes<-paste(GO3[1,2], GO3[2,2], GO3[3,2], sep=',')
+data$HighestMarker<-df[1]
+data$HighestMarker<-df[1]
+data3<-rbind(data3, data)
+}
+colnames(data3)<-c("Cells", "GO_Genes", "HighestMarker")
+cells<-data3$Cells
+data2<-project$cellNames[cells]
+project<-addCellColData(ArchRProj=project, data=data3$GO_Genes, cells=as.vector(data3$Cells), name="MarkerGenes_GO", force=TRUE)
+project<-addCellColData(ArchRProj=project, data=data3$HighestMarker, cells=as.vector(data3$Cells), name="HighestMarker", force=TRUE)
+saveArchRProject(project)
+
+save.image()
+#####################lets visualize all of this nonsense
+p3<-plotEmbedding(ArchRProj=project, colorBy="cellColData", name="Clusters", embedding="UMAP_Combined")+ theme(text = element_text(size=20), aspect.ratio=1)
+p4<-plotEmbedding(ArchRProj = project, colorBy = "cellColData", name = "Samples", embedding = "UMAP_Combined")+ theme(text = element_text(size=20), aspect.ratio=1)
+p5<-plotEmbedding(ArchRProj = project, colorBy = "cellColData", name = "bioNames", embedding = "UMAP_Combined")+ theme(text = element_text(size=20), aspect.ratio=1)
+p6<-plotEmbedding(ArchRProj = project, colorBy = "cellColData", name = "Disease", embedding = "UMAP_Combined")+ theme(text = element_text(size=20), aspect.ratio=1)
+p7<-plotEmbedding(ArchRProj = project, colorBy = "cellColData", name = "GO", embedding = "UMAP_Combined")+ theme(text = element_text(size=120), aspect.ratio=1)
+m1<-plotEmbedding(ArchRProj = project, colorBy = "cellColData", name = "HighestMarker", embedding = "UMAP_Combined") + theme(text = element_text(size=120), aspect.ratio=1)
+p9<-plotEmbedding(ArchRProj = project, colorBy = "cellColData", name = "GO_Genes", embedding = "UMAP_Combined")+ theme(text = element_text(size=120), aspect.ratio=1)
+p8<-plotEmbedding(ArchRProj = project, colorBy = "cellColData", name = "HighestMotif", embedding = "UMAP_Combined") + theme(text = element_text(size=120), aspect.ratio=1)
+p10<-plotEmbedding(ArchRProj = project, colorBy = "cellColData", name = "MotifGO", embedding = "UMAP_Combined") + theme(text = element_text(size=120), aspect.ratio=1)
+
+pdf(file="mesenchyme_incisors_allcelltypes_umap.pdf", height=25, width=25)
+(p3 + p4 )/(p10+ m1)
+(p3|p4)/(p5)
+(p3)/(m1|l1)
+dev.off()
+
+
+###############now assess marker genes
+#https://www.nature.com/articles/s41467-022-32490-y.pdf
+#lhx6, tfap2b, wnt5a label dental mesenchyme
+#pax9, epha3, fxyd7, bmp3, bmp4, Fisp12, dlx1, fgf10, prrx2, sp7, axin1, dact1, egfr1, egr1, sdc2, spry1 are for dental follicle
+#crym, egr3, bmp6, fgf3, foxd1, wif1, runx3 are dental papilla
+#lmo1 is coronal papilla at e16.5
+#fst is apical papilla at e16.5
+#lepr is lateral follicle
+#aldh1a2 is apical follicle
+#sox10 and dhh is schwann cell markers
+#acta2, cspg4, pdgfrb is perivascular cells
+#Frzb, Notch3, Thy1, Myh, Rtn4 are in the dental pulp stem cells
+#Spp1, Ibsp, Stmn2, Aqp1, Alpl, are alveolar bone markers
+project<-addImputeWeights(project, reducedDims='LSI_Combined')
+standardmarkers<-c('Pax9', 'Bmp3', 'Bmp6', 'Dact1', 'Egr1', 'Sdc2', 'Fgf3', 'Foxd1', 'Wif1', 'Runx2', 'Prrx2', 'Tfap2b', 'Lhx6', 'Wnt5a', 'Spp1', 'Ibsp', 'Stmn2', 'Aqp1', 'Alpl', 'Nell1', 'Axin1', 'Barx1', 'Col3a1', 'Egr1', 'Fgf10', 'Fgf3', 'Spry')
+p3<-plotEmbedding(ArchRProj=project, colorBy="cellColData", name="Clusters", embedding="UMAP_Combined")+ theme(text = element_text(size=20), aspect.ratio=1)
+pdf(file="mesenchyme_tooth_standardmarkers_umap.pdf", height=8.5, width=11.5)
+#plot as an overlay on the umap
+for (file in standardmarkers){
+e1<-plotEmbedding(ArchRProj=project, colorBy="GeneExpressionMatrix", name=file, embedding="UMAP_Combined", quantCut=c(0.01, 0.95), imputeWeights=getImputeWeights(project))
+g1<-plotEmbedding(ArchRProj=project, colorBy="GeneScoreMatrix", name=file, embedding="UMAP_Combined", quantCut=c(0.01, 0.95), imputeWeights=getImputeWeights(project))
+f1<-plotGroups(ArchRProj=project, groupBy="Clusters", colorBy="GeneScoreMatrix", name=file, PlotAs="ridges")
+print(p3 + e1 + g1+ f1)
+}
+dev.off()
+
+pdf(file="mesenchyme_incisors_standardmarkers_umap.pdf", height=25, width=15)
+p <- plotEmbedding(ArchRProj = project, colorBy = "GeneExpressionMatrix", name = standardmarkers, embedding = "UMAP_Combined", quantCut = c(0.01, 0.95), imputeWeights = getImputeWeights(project), threads=1)
+p2 <- lapply(p, function(x){
+    x + guides(color = FALSE, fill = FALSE) + 
+    theme_ArchR(baseSize = 6.5) +
+    theme(plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+    theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(), axis.text.y=element_blank(), axis.ticks.y=element_blank())
+})
+do.call(cowplot::plot_grid, c(list(ncol = 3),p2))
+p <- plotGroups(ArchRProj = project, groupBy='Clusters', colorBy='GeneExpressionMatrix', name = standardmarkers, imputeWeights = getImputeWeights(project), PlotAs='ridges', threads=1)
+p2 <- lapply(p, function(x){
+    x + guides(color = FALSE, fill = FALSE) + 
+    theme_ArchR(baseSize = 6.5) +
+    theme(plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+    theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(), axis.text.y=element_blank(), axis.ticks.y=element_blank())
+})
+do.call(cowplot::plot_grid, c(list(ncol = 3),p2))
+p <- plotEmbedding(ArchRProj = project, colorBy = "GeneScoreMatrix", name = standardmarkers, embedding = "UMAP_Combined", quantCut = c(0.01, 0.95), imputeWeights = getImputeWeights(project), threads=1)
+p2 <- lapply(p, function(x){
+    x + guides(color = FALSE, fill = FALSE) + 
+    theme_ArchR(baseSize = 6.5) +
+    theme(plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+    theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(), axis.text.y=element_blank(), axis.ticks.y=element_blank())
+})
+do.call(cowplot::plot_grid, c(list(ncol = 3),p2))
+p <- plotGroups(ArchRProj = project, groupBy='Clusters', colorBy='GeneScoreMatrix', name = standardmarkers, imputeWeights = getImputeWeights(project), PlotAs='ridges', threads=1)
+p2 <- lapply(p, function(x){
+    x + guides(color = FALSE, fill = FALSE) + 
+    theme_ArchR(baseSize = 6.5) +
+    theme(plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+    theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(), axis.text.y=element_blank(), axis.ticks.y=element_blank())
+})
+do.call(cowplot::plot_grid, c(list(ncol = 3),p2))
+p <- plotEmbedding(ArchRProj = project, colorBy = "MotifMatrix", name = markerMotifs1, embedding = "UMAP_Combined", quantCut = c(0.01, 0.95), imputeWeights = getImputeWeights(project), threads=1)
+p2 <- lapply(p, function(x){
+    x + guides(color = FALSE, fill = FALSE) + 
+    theme_ArchR(baseSize = 6.5) +
+    theme(plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+    theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(), axis.text.y=element_blank(), axis.ticks.y=element_blank())
+})
+do.call(cowplot::plot_grid, c(list(ncol = 3),p2))
+p <- plotGroups(ArchRProj = project, groupBy='Clusters', colorBy='MotifMatrix', name = markerMotifs1, imputeWeights = getImputeWeights(project), PlotAs='ridges', threads=1)
+p2 <- lapply(p, function(x){
+    x + guides(color = FALSE, fill = FALSE) + 
+    theme_ArchR(baseSize = 6.5) +
+    theme(plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+    theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(), axis.text.y=element_blank(), axis.ticks.y=element_blank())
+})
+do.call(cowplot::plot_grid, c(list(ncol = 3),p2))
+
+dev.off()
+
+
+
+
+#wnt5a is dental mesenchyme https://anatomypubs.onlinelibrary.wiley.com/doi/full/10.1002/dvdy.22550
+#dental papilla is foxd1, wif1, wnt5a, bmp4, bmp7, bmp4 + 
+dentalfollicle<-c('Epha3', 'Fxyd7', 'Foxf1', 'Pax9')
+dentalpapilla<-c('Crym', 'Egr3', 'Fgf3')
+dentalmesenchyme<-c('Tfap2b', 'Lhx6')
+standardmarkers<-append(dentalpapilla, append(dentalmesenchyme, dentalfollicle))
+p3<-plotEmbedding(ArchRProj=project, colorBy="cellColData", name="Clusters", embedding="UMAP_Combined")+ theme(text = element_text(size=20), aspect.ratio=1)
+pdf(file="mesenchyme_tooth_standardmarkers_umap.pdf", height=8.5, width=11.5)
+for (file in standardmarkers){
+e1<-plotEmbedding(ArchRProj=project, colorBy="GeneScoreMatrix", name=file, embedding="UMAP_Combined", quantCut=c(0.01, 0.95), imputeWeights=getImputeWeights(project))
+g1<-plotGroups(ArchRProj=project, groupBy="Clusters", colorBy="GeneExpressionMatrix", name=file, PlotAs="ridges")
+f1<-plotGroups(ArchRProj=project, groupBy="Clusters", colorBy="GeneScoreMatrix", name=file, PlotAs="ridges")
+print(p3 + e1 + g1+ f1)
+}
+dev.off()
+
+########################rename clusters based on all this information. 
+project$Clusters_old<-project$Clusters
+labelOld<-sort(unique(project$Clusters))
+#1, 2, 3, 4, 5, 6
+labelNew2<-c('Dental Mesenchyme', 'Dental Mesenchyme', 'Dental Mesenchyme', 'Dental Mesenchyme', 'Bone Progenitor Cells', 'Dental Mesenchyme')
+project$Clusters <- mapLabels(project$Clusters, newLabels = labelNew2, oldLabels = labelOld)
+saveArchRProject(project, outputDirectory='tooth_mesenchyme')
+standardmarkers<-c('Bmp3', 'Bmp7', 'Wif1', 'Bmp4', 'Foxd1', 'Msx1', 'Fgf3', 'Smoc2', 'Aox3', 'Lhx6', 'Tfap2b', 'Wnt5a', 'Sdc1', 'Ostn', 'Wnt3a')
+pdf(file="mesenchyme_tooth_standardmarkers_umap_annotated.pdf", height=8.5, width=11.5)
+#plot as an overlay on the umap
+for (file in standardmarkers){
+e1<-plotEmbedding(ArchRProj=project, colorBy="GeneExpressionMatrix", name=file, embedding="UMAP_Combined", quantCut=c(0.01, 0.95), imputeWeights=getImputeWeights(project))
+g1<-plotGroups(ArchRProj=project, groupBy="Clusters", colorBy="GeneExpressionMatrix", name=file, PlotAs="ridges")
+f1<-plotGroups(ArchRProj=project, groupBy="Clusters", colorBy="GeneScoreMatrix", name=file, PlotAs="ridges")
+print(p3 + e1 + g1+ f1)
+}
+dev.off()
+
+e1<-plotEmbedding(ArchRProj = project, colorBy = "cellColData", name = "GO", embedding = "UMAP_Combined")+ theme(text = element_text(size=120), aspect.ratio=1)
+p3<-plotEmbedding(ArchRProj=project, colorBy="cellColData", name="Clusters", embedding="UMAP_Combined") + theme(text = element_text(size=120), aspect.ratio=1)
+p4<-plotEmbedding(ArchRProj = project, colorBy = "cellColData", name = "Samples", embedding = "UMAP_Combined") + theme(text = element_text(size=120), aspect.ratio=1)
+p5<-plotEmbedding(ArchRProj = project, colorBy = "cellColData", name = "MarkerGenes_GO", embedding = "UMAP_Combined") + theme(text = element_text(size=120), aspect.ratio=1)
+d1<-plotEmbedding(ArchRProj = project, colorBy = "cellColData", name = "Disease", embedding = "UMAP_Combined") + theme(text = element_text(size=120), aspect.ratio=1)
+m1<-plotEmbedding(ArchRProj = project, colorBy = "cellColData", name = "HighestMarker", embedding = "UMAP_Combined") + theme(text = element_text(size=120), aspect.ratio=1)
+l1<-plotEmbedding(ArchRProj = project, colorBy = "cellColData", name = "HighestMotif", embedding = "UMAP_Combined") + theme(text = element_text(size=120), aspect.ratio=1)
+
+pdf(file="mesenchyme_incisors_allcelltypes_umap_annotated.pdf", height=25, width=25)
+(p3 + p4)/(d1 + e1 + m1)
+(p3|p4)/(e1|p5)
+(p3|d1)/(m1|l1)
+dev.off()
+
+
+
+
+
+

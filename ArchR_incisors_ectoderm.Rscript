@@ -1,0 +1,151 @@
+library(ArchR)
+ArchR::installExtraPackages()
+library(Seurat)
+library(patchwork)
+library(chromVARmotifs)
+library(tidyverse)
+library(ggplot2)
+library(ggsignif)
+library(parallel)
+set.seed(123)
+library('GenomicFeatures')
+library('org.Mm.eg.db')
+addArchRGenome("mm10")
+addArchRThreads(12)
+orgdb<-org.Mm.eg.db
+project<-loadArchRProject('tooth')
+project<-subsetArchRProject(project, cells = (getCellNames(project)[which(project$Clusters == "Epithelium")]), outputDirectory = 'tooth_ectoderm', dropCells = FALSE, logFile = NULL, threads = getArchRThreads(), force = TRUE)
+
+project <- addIterativeLSI( ArchRProj = project, clusterParams = list(resolution = 0.2, sampleCells = 10000, n.start = 10), saveIterations = FALSE, useMatrix = "GeneExpressionMatrix", depthCol = "Gex_nUMI", varFeatures = 2500, firstSelection = "variable", binarize = FALSE, name = "LSI_RNA", force=TRUE, threads=1)
+
+project<-addIterativeLSI(ArchRProj=project, useMatrix="PeakMatrix", name="LSI_ATAC", force=TRUE, iterations=4, clusterParams=list(resolution=0.5, sampleCells=5000, n.start=10), depthCol="nFrags", saveIterations=FALSE, threads=1)
+saveArchRProject(project, overwrite = TRUE, load = TRUE, outputDirectory='tooth_ectoderm')
+
+project <- addCombinedDims(project, reducedDims = c("LSI_ATAC", "LSI_RNA"), name =  "LSI_Combined")
+project <- addHarmony(ArchRProj = project, reducedDims = "LSI_Combined", name = "Harmony", groupBy = "Batch", force=TRUE, corCutOff=0.25)
+project <- addClusters(project, reducedDims = "Harmony", name = "Clusters", resolution = 0.2, force = TRUE)
+project <- addUMAP(project, reducedDims = "Harmony", name = "UMAP_Combined", minDist = 0.9, force = TRUE)
+
+#this step gets rid of cells with no assigned cluster
+clusters<-rownames(table(project$Clusters))
+data<-BiocGenerics::which(project$Clusters %in% clusters)
+data2<-project$cellNames[data]
+project<-subsetCells(ArchRProj = project, cellNames = data2)
+features<-getGenes(project)
+background<-features$symbol
+genes<-as.data.frame(background)
+genes2<-genes$background
+genes2<-gsub("NA_ENSG", "ENSG", genes2)
+p3<-plotEmbedding(ArchRProj=project, colorBy="cellColData", name="Clusters", embedding="UMAP_ATAC")
+
+#now make umap of those clusters
+p3<-plotEmbedding(ArchRProj=project, colorBy="cellColData", name="Clusters", embedding="UMAP_Combined") + theme(text = element_text(size=120), aspect.ratio=1)
+
+saveArchRProject(project, overwrite = TRUE, load = TRUE, outputDirectory='tooth_ectoderm')
+
+
+library(bedr)
+xxy<-unique(project$Clusters)
+background<-data.frame(granges(getPeakSet(project)))[,1:3]
+colnames(background)<-c('chr', 'start', 'end')
+background$chr<-as.character(background$chr)
+background$start<-as.numeric(background$start)
+background$end<-as.numeric(background$end)
+universe<-getFeatures(project)
+background<-bedr(input=list(i=background), method='sort')
+background<-bedr(input=list(i=background), method='merge')
+
+
+
+universe<-getFeatures(project)
+markersPeaks<-getMarkerFeatures(ArchRProj=project, useMatrix="GeneExpressionMatrix", groupBy="Clusters", bias=c('TSSEnrichment', 'log10(nFrags)'), threads=16)
+markerList <- getMarkers(markersPeaks, cutOff = "FDR <= 0.05 & Log2FC >= 0.5")
+standardmarkers<-NULL
+for (clustername in xxy){
+markers<-markerList[[clustername]]
+markers<-markers[order(markers$Log2FC),]
+standardmarkers<-rbind(standardmarkers, tail(markers,10))
+}
+heatmapGS <- markerHeatmap(seMarker = markersPeaks, cutOff = "FDR <= 0.01 & Log2FC >= 1.25", labelMarkers = standardmarkers$name, transpose = TRUE)
+pdf(file="tooth_epithelium_markergenes_heatmap.pdf", height=25, width=15)
+ComplexHeatmap::draw(heatmapGS, heatmap_legend_side = "bot", annotation_legend_side = "bot")
+dev.off()
+
+library(ggplot2)
+library(rGREAT)
+library(DOSE)
+library(multienrichjam)
+library(clusterProfiler)
+set.seed(123)
+data3<-NULL
+for (clustername in xxy){
+data<-BiocGenerics::which(project$Clusters %in% clustername)
+data2<-project$cellNames[data]
+data<-as.data.frame(data2)
+df <- markerList[[clustername]]
+df<-df[order(-df$Log2FC),5]
+value_bp <- enrichGO(gene = df, universe = universe, OrgDb = 'org.Mm.eg.db', keyType = 'SYMBOL', readable = F, ont = "BP", pvalueCutoff = 0.05, pAdjustMethod = "bonferroni")
+GO3<-simplify(value_bp, cutoff=0.75, by="qvalue")[]
+data$GO_Genes<-paste(GO3[1,2], GO3[2,2], GO3[3,2], sep=',')
+data$HighestMarker<-df[1]
+data$HighestMarker<-df[1]
+data3<-rbind(data3, data)
+}
+colnames(data3)<-c("Cells", "GO_Genes", "HighestMarker")
+cells<-data3$Cells
+data2<-project$cellNames[cells]
+project<-addCellColData(ArchRProj=project, data=data3$GO_Genes, cells=as.vector(data3$Cells), name="MarkerGenes_GO", force=TRUE)
+project<-addCellColData(ArchRProj=project, data=data3$HighestMarker, cells=as.vector(data3$Cells), name="HighestMarker", force=TRUE)
+saveArchRProject(project)
+
+
+
+
+#####################lets visualize all of this nonsense
+e1<-plotEmbedding(ArchRProj = project, colorBy = "cellColData", name = "GO", embedding = "UMAP_Combined")+ theme(text = element_text(size=120), aspect.ratio=1)
+p3<-plotEmbedding(ArchRProj=project, colorBy="cellColData", name="Clusters", embedding="UMAP_Combined") + theme(text = element_text(size=120), aspect.ratio=1)
+p4<-plotEmbedding(ArchRProj = project, colorBy = "cellColData", name = "Samples", embedding = "UMAP_Combined") + theme(text = element_text(size=120), aspect.ratio=1)
+p5<-plotEmbedding(ArchRProj = project, colorBy = "cellColData", name = "MarkerGenes_GO", embedding = "UMAP_Combined") + theme(text = element_text(size=120), aspect.ratio=1)
+d1<-plotEmbedding(ArchRProj = project, colorBy = "cellColData", name = "Disease", embedding = "UMAP_Combined") + theme(text = element_text(size=120), aspect.ratio=1)
+m1<-plotEmbedding(ArchRProj = project, colorBy = "cellColData", name = "HighestMarker", embedding = "UMAP_Combined") + theme(text = element_text(size=120), aspect.ratio=1)
+l1<-plotEmbedding(ArchRProj = project, colorBy = "cellColData", name = "HighestMotif", embedding = "UMAP_Combined") + theme(text = element_text(size=120), aspect.ratio=1)
+
+pdf(file="ectoderm_incisors_allcelltypes_umap.pdf", height=25, width=25)
+(p3 + p4)/(d1 + e1 + m1)
+(p3|p4)/(e1|p5)
+(p3|d1)/(m1|l1)
+dev.off()
+
+
+###############now assess marker genes
+project<-addImputeWeights(project, reducedDims="LSI_Combined")
+standardmarkers<-c('Irx2', 'Pitx2', 'Cdkn1a', 'Barx2', 'Shh', 'Wnt10a', 'Wif1', 'Lef1', 'Pkp1', 'Irf6', 'Grhl3', 'Fgf4', 'Fgf8', 'Nebl', 'Sox2', 'Trp63', 'Foxi3', 'Krt14', 'Krt17', 'Epcam')
+pdf(file="ectoderm_tooth_standardmarkers_umap.pdf", height=8.5, width=11.5)
+for (file in standardmarkers){
+e1<-plotEmbedding(ArchRProj=project, colorBy="GeneExpressionMatrix", name=file, embedding="UMAP_Combined", quantCut=c(0.01, 0.95), imputeWeights=getImputeWeights(project))
+g1<-plotEmbedding(ArchRProj=project, colorBy="GeneScoreMatrix", name=file, embedding="UMAP_Combined", quantCut=c(0.01, 0.95), imputeWeights=getImputeWeights(project))
+f1<-plotGroups(ArchRProj=project, groupBy="Clusters", colorBy="GeneScoreMatrix", name=file, PlotAs="ridges")
+print(p3 + e1 + g1+ f1)
+}
+dev.off()
+
+
+
+########################rename clusters based on all this information. 
+project$Clusters_old<-project$Clusters
+labelOld<-sort(unique(project$Clusters))
+#1, 2, 3, 4, 5, 6
+labelNew2<-c('Periderm', 'Oral Epithelium', 'Dental Epithelium', 'Enamel Knot', 'Dental Epithelium', 'Dental Epithelium')
+project$Clusters <- mapLabels(project$Clusters, newLabels = labelNew2, oldLabels = labelOld)
+saveArchRProject(project, outputDirectory='tooth_ectoderm')
+standardmarkers<-c('Pitx1', 'Pitx2', 'Cdkn1a', 'Barx2', 'Shh', 'Wnt10a', 'Wif1', 'Lef1', 'Wnt5a', 'Wnt3a', 'Bmp4', 'Fgf4', 'Fgf8', 'Nebl', 'Irf6')
+pdf(file="ectoderm_tooth_standardmarkers_annotated_umap.pdf", height=8.5, width=11.5)
+#plot as an overlay on the umap
+for (file in standardmarkers){
+e1<-plotEmbedding(ArchRProj=project, colorBy="GeneExpressionMatrix", name=file, embedding="UMAP_Combined", quantCut=c(0.01, 0.95), imputeWeights=getImputeWeights(project))
+g1<-plotEmbedding(ArchRProj=project, colorBy="GeneScoreMatrix", name=file, embedding="UMAP_Combined", quantCut=c(0.01, 0.95), imputeWeights=getImputeWeights(project))
+f1<-plotGroups(ArchRProj=project, groupBy="Clusters", colorBy="GeneExpressionMatrix", name=file, PlotAs="ridges")
+print(p3 + e1 + g1+ f1)
+}
+dev.off()
+

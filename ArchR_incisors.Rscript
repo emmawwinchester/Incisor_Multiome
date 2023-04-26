@@ -1,0 +1,1026 @@
+library(ArchR)
+ArchR::installExtraPackages()
+library(Seurat)
+library(patchwork)
+library(chromVARmotifs)
+library(tidyverse)
+library(ggplot2)
+library(ggsignif)
+library(parallel)
+set.seed(123)
+library('GenomicFeatures')
+library('org.Mm.eg.db')
+addArchRGenome("mm10")
+addArchRThreads(12)
+orgdb<-org.Mm.eg.db
+library(bedr)
+names<-c('E13_5_incisors_1', 'E13_5_incisors_2', 'E13_5_incisors_3')
+files<-paste('/home/FCAM/ewentworth/cotney/rawdata/mouse/multiome/ATAC/', names, '_atac_fragments.tsv.gz', sep='')
+
+files2<-createArrowFiles(inputFiles=files, sampleNames=names, minTSS=4, minFrags=1000, threads=1, force=TRUE, subThreading=TRUE, addTileMat=TRUE, addGeneScoreMat=TRUE)
+
+
+files2<-list.files(pattern='.arrow')
+files2<-files2[grep('incisor', files2)]
+doubScores<-addDoubletScores(input=files2, threads=1)
+
+project<-ArchRProject(ArrowFiles=files2, outputDirectory="tooth", copyArrows=FALSE, threads = 12)
+outDir<-getOutputDirectory(project)
+saveArchRProject(project, outputDirectory = outDir)
+
+project<-filterDoublets(ArchRProj=project)
+num<-data.frame(table(project$Sample))
+num<-as.character(num[which(num$Freq >= 200),1])
+idxSample <- BiocGenerics::which(project$Sample %in% num)
+cellsSample <- project$cellNames[idxSample]
+project<-project[cellsSample, ]
+saveArchRProject(project, outputDirectory="tooth")
+outDir<-getOutputDirectory(project)
+
+
+df <- getCellColData(project, select = c("log10(nFrags)", "TSSEnrichment"))
+df
+pdf(file="tooth_QC.pdf")
+p <- ggPoint(
+    x = df[,1], 
+    y = df[,2], 
+    colorDensity = TRUE,
+    continuousSet = "sambaNight",
+    xlabel = "Log10 Unique Fragments",
+    ylabel = "TSS Enrichment",
+    xlim = c(log10(500), quantile(df[,1], probs = 0.99)),
+    ylim = c(0, quantile(df[,2], probs = 0.99))
+) + geom_hline(yintercept = 4, lty = "dashed") + geom_vline(xintercept = 3, lty = "dashed")
+
+p
+dev.off()
+
+project$Samples<-gsub("", "", gsub('.*CS', "cs", project$Sample))
+project$bioNames<-gsub("_.*|-.*", "", project$Samples)
+
+outDir<-getOutputDirectory(project)
+
+saveArchRProject(project, outputDirectory = outDir)
+
+##lets look at these different matrices we've created
+pdf(file="tooth_TssEnrichments.pdf", height=8.5, width=11)
+plotGroups(ArchRProj=project, groupBy="Samples", colorBy="cellColData", name="TSSEnrichment", plotAs="ridges")
+plotGroups(ArchRProj=project, groupBy="Samples", colorBy="cellColData", name="log10(nFrags)", PlotAs="ridges")
+plotGroups(ArchRProj=project, groupBy="bioNames", colorBy="cellColData", name="TSSEnrichment", PlotAs="ridges")
+plotGroups(ArchRProj=project, groupBy="bioNames", colorBy="cellColData", name="log10(nFrags)", PlotAs="violin", alpha=0.4, addBoxPlot=TRUE)
+dev.off()
+
+
+
+#####now we'll actually integrate the RNA-seq matrix
+
+names<-unique(project$Samples)
+names<-gsub('cs', 'CS', names)
+files<-paste0("/home/FCAM/ewentworth/cotney/rawdata/mouse/multiome/ATAC/", names, "_filtered_feature_bc_matrix.h5")
+seRNA <- import10xFeatureMatrix(input = files, names = names)
+#seRNAl <- Reduce("cbind", seRNA)
+xxy<-length(seRNA)
+seRNAcombined<-NULL
+for (size in 1:length(seRNA)){
+seRNAcombined<-cbind(seRNAcombined, assay(seRNA[[size]]))
+}
+seRNA2<-SummarizedExperiment(assays=list(counts=seRNAcombined), rowRanges= rowRanges(seRNA[[1]]))
+
+project<-addGeneExpressionMatrix(input=project, seRNA=seRNA2, threads=32)
+project <- project[project$TSSEnrichment > 4 & project$nFrags > 2500 & !is.na(project$Gex_nUMI)]
+
+saveArchRProject(project,  outputDirectory = getOutputDirectory(project), overwrite = TRUE,  load = TRUE)
+
+############now add the RNA umap
+
+project <- addIterativeLSI( ArchRProj = project, clusterParams = list(resolution = 0.2, sampleCells = 10000, n.start = 10), saveIterations = FALSE, useMatrix = "GeneExpressionMatrix", depthCol = "Gex_nUMI", varFeatures = 2500, firstSelection = "variable", binarize = FALSE, name = "LSI_RNA", force=TRUE, threads=1)
+
+
+project<-addIterativeLSI(ArchRProj=project, useMatrix="TileMatrix", name="LSI_ATAC", force=TRUE, iterations=4, clusterParams=list(resolution=0.5, sampleCells=5000, n.start=10), depthCol="nFrags", saveIterations=FALSE, threads=1)
+saveArchRProject(project, outputDirectory = outDir, overwrite = TRUE, load = TRUE)
+
+project <- addCombinedDims(project, reducedDims = c("LSI_ATAC", "LSI_RNA"), name =  "LSI_Combined")
+
+#UMAPs
+project$Batch<-c('Batch1')
+project$Batch[which(project$Sample == 'E13_5_incisors_2')]<-c('Batch2')
+
+project<-addHarmony(project, reducedDims='LSI_Combined', name='Harmony', groupBy='Batch', force=TRUE)
+
+project <- addUMAP(project, reducedDims = "Harmony", name = "UMAP_Combined", minDist = 0.8, force = TRUE)
+project <- addClusters(project, reducedDims = "Harmony", name = "Clusters", resolution = 0.1, force = TRUE)
+
+#this step gets rid of cells with no assigned cluster
+clusters<-rownames(table(project$Clusters))
+data<-BiocGenerics::which(project$Clusters %in% clusters)
+data2<-project$cellNames[data]
+project<-subsetCells(ArchRProj = project, cellNames = data2)
+features<-getGenes(project)
+background<-features$symbol
+genes<-as.data.frame(background)
+genes2<-genes$background
+genes2<-gsub("NA_ENSG", "ENSG", genes2)
+
+saveArchRProject(project, outputDirectory = outDir, overwrite = TRUE, load = TRUE)
+
+#now lets plot the clusterings
+pdf(file="tooth_umap.pdf", height=8.5, width=20)
+p3<-plotEmbedding(ArchRProj=project, colorBy="cellColData", name="Clusters", embedding="UMAP_Combined")
+p4<-plotEmbedding(ArchRProj = project, colorBy = "cellColData", name = "Samples", embedding = "UMAP_Combined")
+p5<-plotEmbedding(ArchRProj = project, colorBy = "cellColData", name = "bioNames", embedding = "UMAP_Combined")
+
+p3 + p4 + p5
+dev.off()
+
+pathToMacs2 <- findMacs2()
+project<-addGroupCoverages(ArchRProj=project, groupBy="Clusters", threads=1, force=TRUE)
+saveArchRProject(project,  outputDirectory = getOutputDirectory(project), overwrite = TRUE,  load = TRUE)
+
+project<-addReproduciblePeakSet(ArchRProj=project, groupBy="Clusters", reproducibility='2', cutoff=0.05, pathToMacs2=pathToMacs2, threads=1, force=TRUE, maxPeaks=50000, promoterRegion = c(2500, 2500))
+saveArchRProject(project,  outputDirectory = getOutputDirectory(project), overwrite = TRUE,  load = TRUE)
+
+getPeakSet(project)
+project<-addPeakMatrix(project, threads=16)
+
+library(JASPAR2020)
+test<-TFBSTools::getMatrixSet(JASPAR2020,opts=list(all_versions=c(FALSE), collection=c('CORE'), tax_group=c('vertebrates'), matrixtype=c('PWM')))
+#now make sure the names of the PWM slots are the TF names, not just the random ass identifiers
+S4_to_dataframe <- function(s4obj) {
+  nms <- slotNames(s4obj)[3]
+
+  lst <- lapply(nms, function(nm) slot(s4obj, nm))
+  as.data.frame(setNames(lst, nms))
+}
+
+flw<-vector("list", length(test))
+for (filename in 1:length(test)){
+symbol<-S4_to_dataframe(test[[filename]])
+symbol<-unique(symbol$name)
+print(filename)
+print(symbol)
+names(test)[[filename]]<-symbol
+test[[filename]]@ID<-symbol
+}
+project <- addMotifAnnotations(ArchRProj = project, motifPWMs=test, name = "Motif", force=TRUE, threads=16)
+project <- addBgdPeaks(project)
+project <- addDeviationsMatrix( ArchRProj = project, peakAnnotation = "Motif", force = TRUE, threads=32)
+saveArchRProject(project)
+
+
+
+list<-paste("/home/FCAM/ewentworth/cotney/analysis/scatac/incisor_multiome/tooth/PeakCalls/", list.files(path='/home/FCAM/ewentworth/cotney/analysis/scatac/incisor_multiome/tooth/PeakCalls/', pattern='rds'), sep="")
+for (filename in list){
+val<-as.data.frame(readRDS(file=filename))
+list1<-gsub('PeakCalls/|-reproduciblePeaks.gr.rds', '', filename)
+bed<-val[,1:3]
+write.table(bed, file=paste(list1, "_incisors_ReproduciblePeaks.bed", sep=''), sep='\t')
+assign(list1, val)
+}
+
+library(bedr)
+background<-read.table(file='/home/FCAM/ewentworth/cotney/rawdata/chromatinsegmentations/mouse_18state/tissue_specific_enhancer_analysis/all_strong_enhancers_background.txt')
+colnames(background)[1:3]<-c('chr', 'start', 'end')
+xxy<-unique(project$Clusters)
+markersPeaks<-getMarkerFeatures(ArchRProj=project, useMatrix="PeakMatrix", groupBy="Clusters", bias=c('TSSEnrichment', 'log10(nFrags)'), testMethod="wilcoxon", threads=16)
+markerList <- getMarkers(markersPeaks, cutOff = "FDR <= 0.05 & Log2FC >= 0.5")
+motifsUp <- peakAnnoEnrichment(seMarker = markersPeaks, ArchRProj = project, peakAnnotation = "Motif", cutOff = "FDR <= 0.05 & Log2FC >= 0.5")
+heatmapEM <- plotEnrichHeatmap(motifsUp, n = 5, transpose = TRUE)
+pdf(file='tooth_motif_enrichment_orig_clusters.pdf', height=8.5, width=11)
+heatmapEM
+dev.off()
+universe<-getFeatures(project)
+markersGenes<-getMarkerFeatures(ArchRProj=project, useMatrix="GeneExpressionMatrix", groupBy="Clusters", bias=c('TSSEnrichment', 'log10(nFrags)'), threads=16)
+markerList <- getMarkers(markersGenes, cutOff = "FDR <= 0.05 & Log2FC >= 0.5")
+
+library(ggplot2)
+library(rGREAT)
+library(DOSE)
+library(multienrichjam)
+library(clusterProfiler)
+set.seed(123)
+data3<-NULL
+for (clustername in xxy){
+data<-BiocGenerics::which(project$Clusters %in% clustername)
+data2<-project$cellNames[data]
+data<-as.data.frame(data2)
+df <- markerList[[clustername]]
+df<-df[order(-df$Log2FC),5]
+value_bp <- enrichGO(gene = df, universe = universe, OrgDb = 'org.Mm.eg.db', keyType = 'SYMBOL', readable = F, ont = "BP", pvalueCutoff = 0.05, pAdjustMethod = "bonferroni")
+GO3<-simplify(value_bp, cutoff=0.75, by="qvalue")[]
+data$GO_Genes<-paste(GO3[1,2], GO3[2,2], GO3[3,2], sep=',')
+data$HighestMarker<-df[1]
+data3<-rbind(data3, data)
+}
+colnames(data3)<-c("Cells", "GO_Genes", "HighestMarker")
+cells<-data3$Cells
+data2<-project$cellNames[cells]
+project<-addCellColData(ArchRProj=project, data=data3$GO_Genes, cells=as.vector(data3$Cells), name="MarkerGenes_GO", force=TRUE)
+project<-addCellColData(ArchRProj=project, data=data3$HighestMarker, cells=as.vector(data3$Cells), name="HighestMarker", force=TRUE)
+saveArchRProject(project)
+
+#####################lets visualize all of this nonsense
+e1<-plotEmbedding(ArchRProj = project, colorBy = "cellColData", name = "GO", embedding = "UMAP_Combined")+ theme(text = element_text(size=120), aspect.ratio=1)
+p3<-plotEmbedding(ArchRProj=project, colorBy="cellColData", name="Clusters", embedding="UMAP_Combined") + theme(text = element_text(size=120), aspect.ratio=1)
+p4<-plotEmbedding(ArchRProj = project, colorBy = "cellColData", name = "Samples", embedding = "UMAP_Combined") + theme(text = element_text(size=120), aspect.ratio=1)
+p5<-plotEmbedding(ArchRProj = project, colorBy = "cellColData", name = "MarkerGenes_GO", embedding = "UMAP_Combined") + theme(text = element_text(size=120), aspect.ratio=1)
+d1<-plotEmbedding(ArchRProj = project, colorBy = "cellColData", name = "Disease", embedding = "UMAP_Combined") + theme(text = element_text(size=120), aspect.ratio=1)
+m1<-plotEmbedding(ArchRProj = project, colorBy = "cellColData", name = "HighestMarker", embedding = "UMAP_Combined") + theme(text = element_text(size=120), aspect.ratio=1)
+l1<-plotEmbedding(ArchRProj = project, colorBy = "cellColData", name = "HighestMotif", embedding = "UMAP_Combined") + theme(text = element_text(size=120), aspect.ratio=1)
+
+pdf(file="incisors_allcelltypes_umap_annotated.pdf", height=25, width=25)
+(p3 + p4)/(d1 + e1 + m1)
+(p3|p4)/(e1|p5)
+(p3|d1)/(m1|l1)
+dev.off()
+
+
+###############now assess marker genes
+project<-addImputeWeights(project, reducedDims="LSI_Combined")
+standardmarkers<-c('PITX1', 'BARX1', 'BARX2', 'SHH', 'WNT10A', 'WIF1', 'PITX2', 'FCER1G', 'HBA1', 'LEF1', 'ENG', 'TP63', 'SOX9', 'EPCAM', 'SOX10', 'CDH5', 'ELAVL3', 'WNT5A', 'WNT3A', 'ACTA2', 'NEBL', 'FOXD1')
+load(file='/home/FCAM/ewentworth/cotney/one2one_ortho.Rdata') #stored as genesV2
+standardmarkers<-genesV2[which(genesV2$HGNC.symbol %in% standardmarkers),2]
+standardmarkers<-intersect(standardmarkers, getFeatures(project))
+heatmapGS <- markerHeatmap(seMarker = markersGenes, cutOff = "FDR <= 0.01 & Log2FC >= 1.25", labelMarkers = standardmarkers, transpose = TRUE)
+pdf(file="tooth_generalcelltypes_standardmarkers_heatmap.pdf", height=25, width=15)
+ComplexHeatmap::draw(heatmapGS, heatmap_legend_side = "bot", annotation_legend_side = "bot")
+dev.off()
+markerMotifs <- getFeatures(project, useMatrix = "MotifMatrix")
+markerMotifs1<-markerMotifs[grep('Sox|Twist|Gas|Gli|Runx|Pitx', markerMotifs, ignore.case=TRUE)]
+standardmarkersmotifs <- grep("z:", markerMotifs1, value = TRUE)
+pdf(file="incisors_standardmarkers_umap.pdf", height=25, width=15)
+p <- plotEmbedding(ArchRProj = project, colorBy = "GeneExpressionMatrix", name = standardmarkers, embedding = "UMAP_Combined", quantCut = c(0.01, 0.95), imputeWeights = getImputeWeights(project), threads=1)
+p2 <- lapply(p, function(x){
+    x + guides(color = FALSE, fill = FALSE) + 
+    theme_ArchR(baseSize = 6.5) +
+    theme(plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+    theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(), axis.text.y=element_blank(), axis.ticks.y=element_blank())
+})
+do.call(cowplot::plot_grid, c(list(ncol = 3),p2))
+p <- plotEmbedding(ArchRProj = project, colorBy = "GeneScoreMatrix", name = standardmarkers, embedding = "UMAP_Combined", quantCut = c(0.01, 0.95), imputeWeights = getImputeWeights(project), threads=1)
+p2 <- lapply(p, function(x){
+    x + guides(color = FALSE, fill = FALSE) + 
+    theme_ArchR(baseSize = 6.5) +
+    theme(plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+    theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(), axis.text.y=element_blank(), axis.ticks.y=element_blank())
+})
+do.call(cowplot::plot_grid, c(list(ncol = 3),p2))
+p <- plotGroups(ArchRProj = project, groupBy='Clusters', colorBy='GeneScoreMatrix', name = standardmarkers, imputeWeights = getImputeWeights(project), PlotAs='ridges', threads=1)
+p2 <- lapply(p, function(x){
+    x + guides(color = FALSE, fill = FALSE) + 
+    theme_ArchR(baseSize = 6.5) +
+    theme(plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+    theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(), axis.text.y=element_blank(), axis.ticks.y=element_blank())
+})
+do.call(cowplot::plot_grid, c(list(ncol = 3),p2))
+p <- plotEmbedding(ArchRProj = project, colorBy = "MotifMatrix", name = standardmarkersmotifs, embedding = "UMAP_Combined", quantCut = c(0.01, 0.95), imputeWeights = getImputeWeights(project), threads=1)
+p2 <- lapply(p, function(x){
+    x + guides(color = FALSE, fill = FALSE) + 
+    theme_ArchR(baseSize = 6.5) +
+    theme(plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+    theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(), axis.text.y=element_blank(), axis.ticks.y=element_blank())
+})
+do.call(cowplot::plot_grid, c(list(ncol = 3),p2))
+dev.off()
+
+######################## now look for correlated genes and motifs
+library(ggrepel)
+seGroupMotif <- getGroupSE(ArchRProj = project, useMatrix = "MotifMatrix", groupBy = "Clusters")
+corGSM_MM <- correlateMatrices(ArchRProj = project, useMatrix1 = "GeneScoreMatrix", useMatrix2 = "MotifMatrix", reducedDims = "LSI_Combined")
+seZ <- seGroupMotif[rowData(seGroupMotif)$seqnames=="z",]
+rowData(seZ)$maxDelta <- lapply(seq_len(ncol(seZ)), function(x){
+  rowMaxs(assay(seZ) - assay(seZ)[,x])
+}) %>% Reduce("cbind", .) %>% rowMaxs
+corGSM_MM$maxDelta <- rowData(seZ)[match(corGSM_MM$MotifMatrix_name, rowData(seZ)$name), "maxDelta"]
+corGSM_MM$maxDelta <- rowData(seZ)[match(corGSM_MM$MotifMatrix_name, rowData(seZ)$name), "maxDelta"]
+corGSM_MM <- corGSM_MM[order(abs(corGSM_MM$cor), decreasing = TRUE), ]
+corGSM_MM <- corGSM_MM[which(!duplicated(gsub("\\-.*","",corGSM_MM[,"MotifMatrix_name"]))), ]
+corGSM_MM$TFRegulator <- "NO"
+corGSM_MM$TFRegulator[which(corGSM_MM$cor > 0.5 & corGSM_MM$padj < 0.05 & corGSM_MM$maxDelta > quantile(corGSM_MM$maxDelta, 0.5))] <- "YES"
+sort(corGSM_MM[corGSM_MM$TFRegulator=="YES",1])
+corGSM_MM<-data.frame(corGSM_MM)
+pdf(file='incisor_covariance_orig_clusters.pdf')
+ggplot(data.frame(corGSM_MM), aes(cor, maxDelta, color = TFRegulator, label=TFRegulator)) +  geom_point() + theme_ArchR() + geom_vline(xintercept = 0, lty = "dashed") + scale_color_manual(values = c("NO"="darkgrey", "YES"="firebrick3")) + xlab("Correlation To Gene Score") + ylab("Max TF Motif Delta") + scale_y_continuous(expand = c(0,0), limits = c(0, max(corGSM_MM$maxDelta)*1.15)) + geom_label_repel(data=corGSM_MM[corGSM_MM$TFRegulator=="YES",], aes(x=cor, y=maxDelta, label=GeneScoreMatrix_name)) 
+dev.off()
+seGroupMotif <- getGroupSE(ArchRProj = project, useMatrix = "MotifMatrix", groupBy = "Clusters")
+corGSM_MM <- correlateMatrices(ArchRProj = project, useMatrix1 = "GeneExpressionMatrix", useMatrix2 = "MotifMatrix", reducedDims = "LSI_Combined")
+seZ <- seGroupMotif[rowData(seGroupMotif)$seqnames=="z",]
+rowData(seZ)$maxDelta <- lapply(seq_len(ncol(seZ)), function(x){
+  rowMaxs(assay(seZ) - assay(seZ)[,x])
+}) %>% Reduce("cbind", .) %>% rowMaxs
+corGSM_MM$maxDelta <- rowData(seZ)[match(corGSM_MM$MotifMatrix_name, rowData(seZ)$name), "maxDelta"]
+corGSM_MM$maxDelta <- rowData(seZ)[match(corGSM_MM$MotifMatrix_name, rowData(seZ)$name), "maxDelta"]
+corGSM_MM <- corGSM_MM[order(abs(corGSM_MM$cor), decreasing = TRUE), ]
+corGSM_MM <- corGSM_MM[which(!duplicated(gsub("\\-.*","",corGSM_MM[,"MotifMatrix_name"]))), ]
+corGSM_MM$TFRegulator <- "NO"
+corGSM_MM$TFRegulator[which(corGSM_MM$cor > 0.5 & corGSM_MM$padj < 0.05 & corGSM_MM$maxDelta > quantile(corGSM_MM$maxDelta, 0.5))] <- "YES"
+sort(corGSM_MM[corGSM_MM$TFRegulator=="YES",1])
+corGSM_MM<-data.frame(corGSM_MM)
+pdf(file='incisor_covariance_geneexpression_orig_clusters.pdf')
+ggplot(data.frame(corGSM_MM), aes(cor, maxDelta, color = TFRegulator, label=TFRegulator)) +  geom_point() + theme_ArchR() + geom_vline(xintercept = 0, lty = "dashed") + scale_color_manual(values = c("NO"="darkgrey", "YES"="firebrick3")) + xlab("Correlation To Gene Score") + ylab("Max TF Motif Delta") + scale_y_continuous(expand = c(0,0), limits = c(0, max(corGSM_MM$maxDelta)*1.15)) + geom_label_repel(data=corGSM_MM[corGSM_MM$TFRegulator=="YES",], aes(x=cor, y=maxDelta, label=GeneScoreMatrix_name)) 
+dev.off()
+
+########################rename clusters based on all this information. 
+project$Clusters_old<-project$Clusters
+labelOld<-sort(unique(project$Clusters))
+#1, 10, 11, 2, 3, 4, 5, 6, 7, 8, 9
+labelNew2<-c('Red Blood Cells', 'Mesenchyme', 'Mesenchyme', 'Endothelium', 'Other Blood Cells', 'Neural Progenitor Cells', 'Neural Progenitor Cells', 'Epithelium', 'Neural Progenitor Cells', 'Perivascular Cells', 'Mesenchyme')
+project$Clusters <- mapLabels(project$Clusters, newLabels = labelNew2, oldLabels = labelOld)
+saveArchRProject(project)
+
+markers<-read.table('~/cotney/analysis/bulkRNA/tooth/WGCNA/e14_molar_sc_markergenes_percluster.tsv')
+markers<-markers[which(markers$avg_logFC >= 0.5 & markers$p_val_adj <= 0.05),]
+x<-unique(markers$cluster)
+universe<-getFeatures(project, useMatrix='GeneExpressionMatrix')
+for (val in x){
+print(val)
+markergenes<-markers[which(markers$cluster == val & markers$p_val_adj <= 0.05 & markers$avg_logFC >= 0.5),7]
+markergenes<-intersect(universe, markergenes)
+print(length(markergenes))
+assign(paste(gsub(' |-|_', '', gsub(' ', '', val)), "markergenes", sep="_"), markergenes)
+}
+project<-addModuleScore(ArchRProj = project, useMatrix = 'GeneExpressionMatrix', features = list(OtherBloodCells = OtherBloodCells_markergenes, RedBloodCells=RedBloodCells_markergenes, EnamelKnot=EnamelKnot_markergenes, Epithelium=Epithelium_markergenes, Mesenchyme=Mesenchyme_markergenes, PerivascularCells=PerivascularCells_markergenes, Endothelium=Endothelium_markergenes), seed = 1)
+p3<-plotEmbedding(ArchRProj=project, colorBy="cellColData", name="Clusters", embedding="UMAP_Combined") + theme(text = element_text(size=120), aspect.ratio=1)
+
+pdf(file='tooth_ATAC_markergenes_knowncelltypes.pdf', height=8.5, width=11.5)
+for (val in x){
+e1 <- plotEmbedding(project, name=paste('Module', gsub(' ', '', val), sep='.'), colorBy = "cellColData", embedding='UMAP_Combined')
+f1<-plotGroups(ArchRProj=project, groupBy="Clusters", name=paste('Module', gsub(' ', '', val), sep='.'), PlotAs="ridges")
+print(p3 + e1 + f1)
+}
+dev.off()
+saveArchRProject(project, outputDirectory = getOutputDirectory(project),  overwrite = TRUE,  load = TRUE)
+
+#############################now do subclustering based on ectoderm and mesenchymal cell types!
+########then we come back in and re-annotate the cell types 
+project<-loadArchRProject('tooth')
+project$orig.clusters<-project$Clusters_old
+
+ecto<-loadArchRProject('tooth_ectoderm')
+xxy<-unique(ecto$Clusters)
+data2<-NULL
+for (clustername in xxy){
+data2<-ecto$cellNames[which(ecto$Clusters %in% clustername)]
+project$Clusters[which(project$cellNames %in% data2)]<-clustername
+}
+mes<-loadArchRProject('tooth_mesenchyme')
+xxy<-unique(mes$Clusters)
+data2<-NULL
+for (clustername in xxy){
+data2<-mes$cellNames[which(mes$Clusters %in% clustername)]
+project$Clusters[which(project$cellNames %in% data2)]<-clustername
+}
+saveArchRProject(project, outputDirectory = getOutputDirectory(project),  overwrite = TRUE,  load = TRUE)
+
+markers<-read.table('~/cotney/analysis/bulkRNA/tooth/WGCNA/e14_molar_sc_markergenes_percluster.tsv')
+markers<-markers[which(markers$avg_logFC >= 0.5 & markers$p_val_adj <= 0.05),]
+x<-unique(markers$cluster)
+universe<-getFeatures(project, useMatrix='GeneScoreMatrix')
+list1<-NULL
+for (val in x){
+mod<-list(module=c(intersect(universe, markers[which(markers$cluster == val),7])))
+names(mod)<-gsub(' ', '', val)
+list1<-append(list1, mod)
+}
+project<-addModuleScore(project, name=names(list1), useMatrix='GeneScoreMatrix', features=list1, nBgd=100, nBin=25, seed=1, threads=1)
+p3<-plotEmbedding(ArchRProj=project, colorBy="cellColData", name="Clusters", embedding="UMAP_Combined")+ theme(text = element_text(size=20), aspect.ratio=1)
+
+pdf(file='annotated_tooth_ATAC_markergenes_knowncelltypes.pdf', height=8.5, width=11.5)
+for (val in x){
+e1 <- plotEmbedding(project, name=paste0(gsub(' ', '', val), '.', gsub(' ', '', val)), colorBy = "cellColData", embedding='UMAP_Combined')
+f1<-plotGroups(ArchRProj=project, groupBy="Clusters", name=paste0(gsub(' ', '', val), '.', gsub(' ', '', val)), PlotAs="ridges")
+print(p3 + e1 + f1)
+}
+dev.off()
+
+table<-read.table(file="~/cotney/analysis/scrna/e14_molar/for_publication/Epithelium_Incisor_Paper_DevBioPaper.txt", sep="\t")
+nodes<-unique(table$V2)
+for (node in nodes){
+y<-table[table$V2 == node,]
+y<-y$V1
+assign(paste(gsub(' |\\(|\\)|\\/', '', node), 'Module', sep='_'), y)
+}
+x<-ls(pattern='_Module')
+universe<-getFeatures(project, useMatrix='GeneScoreMatrix')
+list1<-NULL
+for (val in x){
+mod<-list(module=c(intersect(universe, get(val))))
+names(mod)<-gsub('_Module', '', val)
+list1<-append(list1, mod)
+}
+project<-addModuleScore(project, name=names(list1), useMatrix='GeneScoreMatrix', features=list1, nBgd=100, nBin=25, seed=1, threads=1)
+p3<-plotEmbedding(ArchRProj=project, colorBy="cellColData", name="Clusters", embedding="UMAP_Combined")+ theme(text = element_text(size=20), aspect.ratio=1)
+
+pdf(file='annotated_tooth_ATAC_markergenes_knowncelltypes_JK.pdf', height=8.5, width=11.5)
+for (val in x){
+e1 <- plotEmbedding(project, name=paste0(gsub('_Module', '', val), '.', gsub('_Module', '', val)), colorBy = "cellColData", embedding='UMAP_Combined')
+f1<-plotGroups(ArchRProj=project, groupBy="Clusters", name=paste0(gsub('_Module', '', val), '.', gsub('_Module', '', val)), PlotAs="ridges")
+print(p3 + e1 + f1)
+}
+dev.off()
+
+
+
+pathToMacs2 <- findMacs2()
+project<-addGroupCoverages(ArchRProj=project, groupBy="Clusters", minReplicates = 2, threads=1, force=TRUE)
+saveArchRProject(project,  outputDirectory = getOutputDirectory(project), overwrite = TRUE,  load = TRUE)
+
+project<-addReproduciblePeakSet(ArchRProj=project, groupBy="Clusters", cutoff=0.05, pathToMacs2=pathToMacs2, threads=1, force=TRUE, maxPeaks=150000, promoterRegion = c(2500, 2500))
+saveArchRProject(project,  outputDirectory = getOutputDirectory(project), overwrite = TRUE,  load = TRUE)
+
+getPeakSet(project)
+project<-addPeakMatrix(project, threads=1, force=TRUE)
+
+library(JASPAR2020)
+test<-TFBSTools::getMatrixSet(JASPAR2020,opts=list(all_versions=c(FALSE), collection=c('CORE'), tax_group=c('vertebrates'), matrixtype=c('PWM')))
+#now make sure the names of the PWM slots are the TF names, not just the random ass identifiers
+S4_to_dataframe <- function(s4obj) {
+  nms <- slotNames(s4obj)[3]
+
+  lst <- lapply(nms, function(nm) slot(s4obj, nm))
+  as.data.frame(setNames(lst, nms))
+}
+
+flw<-vector("list", length(test))
+for (filename in 1:length(test)){
+symbol<-S4_to_dataframe(test[[filename]])
+symbol<-unique(symbol$name)
+print(filename)
+print(symbol)
+names(test)[[filename]]<-symbol
+test[[filename]]@ID<-symbol
+}
+project <- addMotifAnnotations(ArchRProj = project, motifPWMs=test, name = "Motif", force=TRUE, threads=16)
+project <- addBgdPeaks(project)
+project <- addDeviationsMatrix( ArchRProj = project, peakAnnotation = "Motif", force = TRUE, threads=16)
+saveArchRProject(project)
+getGroupBW(ArchRProj = project, groupBy = "Sample", normMethod = "ReadsInTSS", tileSize = 100, maxCells = 1000, ceiling = 4, verbose = TRUE, threads = 1, logFile = createLogFile("getGroupBW"))
+getGroupBW( ArchRProj = project, groupBy = "Clusters", normMethod = "nFrags", tileSize = 100, maxCells = 1000, ceiling = 4, verbose = TRUE, threads = 1, logFile = createLogFile("getGroupBW"))
+getGroupBW(ArchRProj = project, groupBy = "Clusters", normMethod = "ReadsInTSS", tileSize = 100, maxCells = 1000, ceiling = 4, verbose = TRUE, threads = 1, logFile = createLogFile("getGroupBW"))
+system("scp -r /home/FCAM/ewentworth/cotney/analysis/scatac/incisor_multiome/tooth/GroupBigWigs/Clusters/* /tgc/TGCore_User_Data/WebData/cotney/hubs/ChIP/ewentworth/incisor_multiome/.")
+system("chmod -R 755 /tgc/TGCore_User_Data/WebData/cotney/hubs/ChIP/ewentworth/incisor_multiome")
+
+list<-list.files(path='/home/FCAM/ewentworth/cotney/analysis/scatac/incisor_multiome/tooth/PeakCalls/', pattern='Peaks.gr.rds')
+list1<-list[grep('Epithelium|Endothelium|Mesenchyme|Blood|Cells|Enamel|Periderm', list)]
+list1<-list1[grep('Early|Late|Middle|Other|Red', list1, invert=TRUE)]
+list<-paste("/home/FCAM/ewentworth/cotney/analysis/scatac/incisor_multiome/tooth/PeakCalls/", list1, sep="")
+for (filename in list){
+val<-as.data.frame(readRDS(file=filename))
+bed<-val[,c(1,2,3,4,6,5,6,9,10,11)]
+bed[,c('Reproducibility', 'GroupReplicate', 'distToGeneStart')]<-bed$score
+list1<-gsub('/home/FCAM/ewentworth/cotney/analysis/scatac/incisor_multiome/tooth/PeakCalls/|-reproduciblePeaks.gr.rds', '', filename)
+print(filename)
+print(dim(bed))
+write.table(bed, file=paste('/home/FCAM/ewentworth/cotney/analysis/abcenhancer/tooth/', list1, "_general_celltypes.bed", sep=''), sep='\t', quote=F, col.names=F, row.names=F)
+assign(list1, val)
+}
+
+
+getGroupBW(project, groupBy='Clusters', threads=1)
+system("scp -r /home/FCAM/ewentworth/cotney/analysis/scatac/incisor_multiome/tooth/GroupBigWigs/Clusters/* ~/cotney/analysis/abcenhancer/tooth/.")
+
+tab1<-getGroupSE(project, useMatrix='GeneExpressionMatrix', groupBy='Clusters', scaleTo=1000000, divideN=FALSE)
+genes<-read.table(file='~/cotney/genome/mm10/ArchR_gene_coordinates_mm10.tsv', sep='\t')
+tab<-data.frame(assay(tab1))
+row.names(tab)<-rowData(tab1)$name
+tab<-tab[grep('Rik|LINC|LOC|^Gm', rownames(tab), invert=TRUE,ignore.case=TRUE), ]
+tab<-tab[which(rownames(tab) %in% genes$V4),]
+x<-as.character(colnames(tab))
+for (filename in x){
+file1<-data.frame(tab[,which(colnames(tab) %in% filename)])
+rownames(file1)<-rownames(tab)
+write.table(file1, file=paste0('~/cotney/analysis/abcenhancer/tooth/', gsub(' ', '.', filename), '_general_celltypes_TPM.tsv'), quote=F, row.names=T, col.names=F, sep='\t')
+}
+
+saveArchRProject(project)
+
+
+##########see which samples' enhancers are enriched in each cell type
+beds<-t(read.table("../mouse_multiome/beds.txt", sep="\t"))
+colnames(beds)<-beds[1,]
+beds<-beds[2,]
+
+
+markersPeaks_combined<-getMarkerFeatures(ArchRProj=project, useMatrix="PeakMatrix", groupBy="Clusters", bias=c("TSSEnrichment", "log10(nFrags)"), testMethod="wilcoxon")
+
+project <- addPeakAnnotations(ArchRProj = project, regions = beds, name = "Enhancers", force=TRUE)
+enrichRegions1 <- peakAnnoEnrichment(seMarker = markersPeaks_combined, ArchRProj = project, peakAnnotation = "Enhancers", cutOff = "FDR <= 0.1 & Log2FC >= 0.1")
+project <- addArchRAnnotations(ArchRProj = project, db='LOLA', collection = "EncodeTFBS", force=TRUE)
+enrichRegions2 <- peakAnnoEnrichment(seMarker = markersPeaks_combined, ArchRProj = project, peakAnnotation = "EncodeTFBS", cutOff = "FDR <= 0.1 & Log2FC >= 0.1")
+project <- addArchRAnnotations(ArchRProj = project, db='LOLA', collection = "Codex", force=TRUE)
+enrichRegions3 <- peakAnnoEnrichment(seMarker = markersPeaks_combined, ArchRProj = project, peakAnnotation = "Codex", , cutOff = "FDR <= 0.1 & Log2FC >= 0.1")
+
+pdf("incisor_18state_strong_enhancer_enrichment_heatmap.pdf", height=8, width=24)
+plotEnrichHeatmap(enrichRegions1, n = 10, transpose = TRUE)
+plotEnrichHeatmap(enrichRegions2, n = 10, transpose = TRUE)
+plotEnrichHeatmap(enrichRegions3, n = 10, transpose = TRUE)
+dev.off()
+
+library(bedr)
+load(file='/home/FCAM/ewentworth/cotney/one2one_ortho.Rdata') #stored as genesV2
+
+xxy<-unique(project$Clusters)
+#####look at motifs enriched per cluster's marker peaks
+markersPeaks_combined<-getMarkerFeatures(ArchRProj=project, useMatrix="PeakMatrix", groupBy="Clusters", bias=c('TSSEnrichment', 'log10(nFrags)'), testMethod="wilcoxon", threads=16)
+markerList <- getMarkers(markersPeaks_combined, cutOff = "FDR <= 0.05 & Log2FC >= 1.0")
+
+motifsUp <- peakAnnoEnrichment(seMarker = markersPeaks_combined, ArchRProj = project, peakAnnotation = "Motif", cutOff = "FDR <= 0.05 & Log2FC >= 1.0")
+heatmapEM <- plotEnrichHeatmap(motifsUp, n = 5, transpose = TRUE)
+pdf(file='tooth_motif_enrichment_annotated_clusters.pdf', height=8.5, width=11)
+heatmapEM
+dev.off()
+
+markergenes<-getMarkerFeatures(ArchRProj=project, useMatrix="GeneExpressionMatrix", groupBy="Clusters", bias=c('Gex_nUMI'), testMethod="wilcoxon", threads=1)
+markerList2 <- getMarkers(markergenes, cutOff = "FDR <= 0.05 & Log2FC >= 0.5")
+
+background<-read.table(file='/home/FCAM/ewentworth/cotney/rawdata/chromatinsegmentations/mouse_18state/tissue_specific_enhancer_analysis/all_enhancers_all_samples.bed')
+colnames(background)[1:3]<-c('chr', 'start', 'end')
+background<-bedr(input=list(i=background), method='sort')
+background<-bedr(input=list(i=background), method='merge')
+chromsize<-read.table(file='~/cotney/genome/mm10/mm10.chrom.sizes')
+chromsize<-chromsize[grep('Random|Un|alt', chromsize$V1, ignore.case=TRUE, invert=TRUE),]
+chromsize$start<-0
+colnames(chromsize)<-c('chr', 'end', 'start')
+chromsize<-chromsize[,c(1,3,2)]
+chromsize<-bedr(input=list(i=chromsize), method='sort')
+background<-bedr(input=list(a=background, b=chromsize), method='intersect', params=c('-sorted -wa -wb'), verbose=FALSE)
+background<-background[-which(background$end > background$end.b),]
+
+xxy<-unique(project$Clusters)
+universe<-getFeatures(project)
+
+############now look at the GO enrichment of the predicted targets of marker peaks for each cell type
+
+library(ggplot2)
+library(rGREAT)
+library(DOSE)
+library(multienrichjam)
+library(clusterProfiler)
+set.seed(123)
+data3<-NULL
+for (clustername in xxy){
+bed<-read.table(file=paste('tooth/', gsub(" ", ".", clustername), "_incisors_ReproduciblePeaks.bed", sep=""), sep='\t', header=TRUE)
+bed<-bedr(input=list(i=bed), method='sort')
+colnames(bed)<-c('chr', 'start', 'end')
+bed<-bedr(input=list(a=background, b=bed), method='intersect', params=c('-sorted -wo'))
+print(dim(bed))
+background1<-rbind(background[,1:3], bed[,1:3])
+job = submitGreatJob(bed[,1:3], bg=background1, rule = c("basalPlusExt"), species='mm10')
+tb<-getEnrichmentTables(job, category=c('GO', 'Phenotype'))
+DO<-tb[["Mouse Phenotype"]]
+GO<-tb[["GO Biological Process"]]
+data<-BiocGenerics::which(project$Clusters %in% clustername)
+data2<-project$cellNames[data]
+data<-as.data.frame(data2)
+data$GO<-paste(GO[1,2], GO[2,2], GO[3,2], sep=',')
+data$DO<-paste(DO[1,2], DO[2,2], DO[3,3], sep=',')
+df <- markerList2[[clustername]]
+df<-df[order(-df$Log2FC),5]
+value_bp <- enrichGO(gene = df, universe = universe, OrgDb = 'org.Mm.eg.db', keyType = 'SYMBOL', readable = F, ont = "BP", pvalueCutoff = 0.05, pAdjustMethod = "bonferroni")
+GO3<-data.frame(clusterProfiler::simplify(value_bp))
+data$GO_Genes<-paste(GO3[1,2], GO3[2,2], GO3[3,2], sep=',')
+data$HighestMarker<-df[1]
+df <- data.frame(assay(motifsUp))
+df$Motif<-rownames(df)
+df2<-data.frame(df[,which(colnames(df) == gsub(' ', '.', clustername))], df$Motif)
+list<-gsub('_.*|\\..*', '', head(df2[order(df2[,2]),2], 100))
+value_bp <- enrichGO(gene = list, OrgDb = 'org.Hs.eg.db', keyType = 'SYMBOL', readable = F, ont = "BP", pvalueCutoff = 0.05, pAdjustMethod = "bonferroni")
+GO2<-simplify(value_bp, cutoff=0.75, by="qvalue")[]
+data$GO_Motif<-paste(GO2[1,2], GO2[2,2], GO2[3,2], sep=',')
+data$Motif<-df[1,2]
+data3<-rbind(data3, data)
+}
+colnames(data3)<-c("Cells", "GO", "DO", "GO_Genes", "HighestMarker", 'HighestMotif')
+cells<-data3$Cells
+data2<-project$cellNames[cells]
+project<-addCellColData(ArchRProj=project, data=data3$GO, cells=as.vector(data3$Cells), name="GO", force=TRUE)
+project<-addCellColData(ArchRProj=project, data=data3$DO, cells=as.vector(data3$Cells), name="Disease", force=TRUE)
+project<-addCellColData(ArchRProj=project, data=data3$GO_Genes, cells=as.vector(data3$Cells), name="MarkerGenes_GO", force=TRUE)
+project<-addCellColData(ArchRProj=project, data=data3$HighestMotif, cells=as.vector(data3$Cells), name="HighestMotif", force=TRUE)
+project<-addCellColData(ArchRProj=project, data=data3$HighestMarker, cells=as.vector(data3$Cells), name="HighestMarker", force=TRUE)
+saveArchRProject(project)
+
+############generate the actual cell type specific enhancers
+data3<-NULL
+#first identify all enhancers that overlap peaks for each celltype
+for (filename in xxy){
+print(filename)
+bed<-read.table(file=paste('tooth/', gsub(" ", ".", filename), "_incisors_ReproduciblePeaks.bed", sep=""), sep='\t', header=TRUE)
+colnames(bed)<-c('chr', 'start', 'end')
+bed<-bedr(input=list(i=bed), method='sort', verbose=F)
+bed<-bedr(input=list(i=bed), method='merge', verbose=F)
+rownames(bed)<-c(1:(dim(bed)[1]))
+enh<-bedr(engine='bedtools', input=list(a=background, b=bed), method='intersect', params='-sorted -wo', verbose=F)
+colnames(enh)<-c('chr', 'start', 'end', 'peakchr', 'peakstart', 'peakend', 'overlap')
+write.table(enh, file=paste(gsub(" ", ".", filename), '_allenhancers.bed', sep=''), sep='\t', quote=F, row.names=F, col.names=F)
+assign(gsub(' ', '.', filename), enh[,1:3])
+}
+
+#then identify cell type specific enhancers (compared to all enhancers which overlap all other cell types)
+#also look at the predicted ontology of predicted target genes
+for (filename in xxy){
+inter=NULL
+non<-xxy[grep(gsub(' ', '.', filename), xxy, invert=TRUE)]
+for (names in non){
+inter<-rbind(inter, get(gsub(' ', '.', names)))
+}
+inter<-bedr(input=list(i=inter), method='sort', verbose=F)
+inter<-bedr(input=list(i=inter), method='merge', verbose=F)
+print(dim(inter))
+print(filename)
+yes<-get(gsub(' ', '.', filename))
+enh2<-bedr(engine='bedtools', input=list(a=yes, b=inter), method='intersect', params='-sorted -wo', verbose=F)
+enh2$peak<-paste(enh2$chr, enh2$start, enh2$end, sep='_')
+yes$peak<-paste(yes$chr, yes$start, yes$end, sep='_')
+enh2<-yes[-which(yes$peak %in% enh2$peak),]
+colnames(enh2)<-c('chr', 'start', 'end', 'peak')
+write.table(enh2, file=paste(gsub(" ", ".", filename), "_incisors_celltypespecificenhancers.bed", sep=""), sep='\t', quote=F, row.names=F, col.names=F)
+print(dim(enh2))
+background1<-rbind(background[,1:3], enh2[,1:3])
+job = submitGreatJob(enh2[,1:3], bg=background1, rule = c("basalPlusExt"), species='mm10')
+geneenh<-plotRegionGeneAssociationGraphs(job)
+geneenh<-data.frame(table(geneenh$gene))
+geneenh<-geneenh[order(-geneenh$Freq),]
+tb<-getEnrichmentTables(job, ontology=c("GO Biological Process", "Mouse Phenotype"))
+DO<-tb[["Mouse Phenotype"]]
+print(head(DO))
+GO<-tb[["GO Biological Process"]]
+print(head(GO))
+data<-BiocGenerics::which(project$Clusters %in% filename)
+data2<-project$cellNames[data]
+data<-as.data.frame(data2)
+data$GO<-paste(GO[1,2], GO[2,2], GO[3,2], sep=',')
+data$DO<-paste(DO[1,2], DO[2,2], DO[3,3], sep=',')
+df<-geneenh %>% mutate(quartile = ntile(Freq, 10))
+df<-df[which(df$quartile == 10),1]
+value_bp <- enrichGO(gene = df, universe = universe, OrgDb = 'org.Mm.eg.db', keyType = 'SYMBOL', readable = F, ont = "BP", pvalueCutoff = 0.05, pAdjustMethod = "bonferroni")
+GO3<-clusterProfiler::simplify(value_bp, cutoff=0.75, by="qvalue")[]
+data$GO_TopEnhGenes<-paste(GO3[1,2], GO3[2,2], GO3[3,2], sep=',')
+data3<-rbind(data3, data)
+}
+colnames(data3)<-c("Cells", "GO", "Disease", "GOTopEnhGenes")
+cells<-data3$Cells
+data2<-project$cellNames[cells]
+project<-addCellColData(ArchRProj=project, data=data3$GO, cells=as.vector(data3$Cells), name="csenhGO", force=TRUE)
+project<-addCellColData(ArchRProj=project, data=data3$Disease, cells=as.vector(data3$Cells), name="csenhDisease", force=TRUE)
+project<-addCellColData(ArchRProj=project, data=data3$GOTopEnhGenes, cells=as.vector(data3$Cells), name="csenhTopGene", force=TRUE)
+saveArchRProject(project)
+
+
+#####################lets visualize all of this nonsense
+p3<-plotEmbedding(ArchRProj=project, colorBy="cellColData", name="Clusters", embedding="UMAP_Combined")+ theme(text = element_text(size=20), aspect.ratio=1)
+p4<-plotEmbedding(ArchRProj = project, colorBy = "cellColData", name = "Samples", embedding = "UMAP_Combined")+ theme(text = element_text(size=20), aspect.ratio=1)
+p5<-plotEmbedding(ArchRProj = project, colorBy = "cellColData", name = "MarkerGenes_GO", embedding = "UMAP_Combined") + theme(text = element_text(size=120), aspect.ratio=1)
+p6<-plotEmbedding(ArchRProj=project, colorBy="cellColData", name="csenhGO", embedding="UMAP_Combined")+ theme(text = element_text(size=20), aspect.ratio=1)
+p7<-plotEmbedding(ArchRProj = project, colorBy = "cellColData", name = "csenhDisease", embedding = "UMAP_Combined")+ theme(text = element_text(size=20), aspect.ratio=1)
+p8<-plotEmbedding(ArchRProj = project, colorBy = "cellColData", name = "Disease", embedding = "UMAP_Combined")+ theme(text = element_text(size=20), aspect.ratio=1)
+e1<-plotEmbedding(ArchRProj = project, colorBy = "cellColData", name = "GO", embedding = "UMAP_Combined")+ theme(text = element_text(size=120), aspect.ratio=1)
+m1<-plotEmbedding(ArchRProj = project, colorBy = "cellColData", name = "HighestMarker", embedding = "UMAP_Combined") + theme(text = element_text(size=120), aspect.ratio=1)
+l1<-plotEmbedding(ArchRProj = project, colorBy = "cellColData", name = "HighestMotif", embedding = "UMAP_Combined") + theme(text = element_text(size=120), aspect.ratio=1)
+
+pct4<-table(project$Clusters, project$Samples)
+pct4<-as.data.frame(pct4)
+s4a<-ggplot(pct4, aes(x = Var2, y = Freq, fill = Var1)) + theme_bw(base_size = 15) + geom_col(position = "fill", width = 0.5) + xlab("Samples") +  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +  ylab("Proportion") + theme(text = element_text(size=20), aspect.ratio=1)+ theme(legend.title = element_blank()) + ggtitle('ATAC UMAP')
+s4b<-ggplot(pct4, aes(x = Var1, y = Freq, fill = Var2)) + theme_bw(base_size = 15) + geom_col(position = "fill", width = 0.5) + xlab("Samples") +  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +  ylab("Proportion") + theme(text = element_text(size=20), aspect.ratio=1)+ theme(legend.title = element_blank()) + ggtitle('ATAC UMAP')
+
+pdf(file="incisors_allcelltypes_umap_annotated.pdf", height=25, width=25)
+(p3 + p4 + p5)/(p6 + p7 + p8)
+(p3|e1)/(m1|l1)
+(p3|p4)/(s4a + s4b) + plot_annotation("UMAP Cluster Breakdown by Sample")
+dev.off()
+
+
+###############compare to the marker genes from the scRNA results
+markers<-read.table('~/cotney/analysis/bulkRNA/tooth/WGCNA/e14_molar_sc_markergenes_percluster.tsv')
+universe<-getFeatures(project, useMatrix='GeneExpressionMatrix')
+markers<-markers[which(markers$avg_logFC >= 0.5 & markers$p_val_adj <= 0.05),]
+x<-unique(markers$cluster)
+for (val in x){
+print(val)
+markergenes<-markers[which(markers$cluster == val & markers$p_val_adj <= 0.05 & markers$avg_logFC >= 0.5),7]
+markergenes<-intersect(universe, markergenes)
+print(length(markergenes))
+assign(paste(gsub(' |-|_', '', gsub(' ', '', val)), "markergenes", sep="_"), markergenes)
+}
+project<-addModuleScore(ArchRProj = project, useMatrix = 'GeneExpressionMatrix', features = list(OtherBloodCells = OtherBloodCells_markergenes, RedBloodCells=RedBloodCells_markergenes, EnamelKnot=EnamelKnot_markergenes, Epithelium=Epithelium_markergenes, Mesenchyme=Mesenchyme_markergenes, PerivascularCells=PerivascularCells_markergenes, Endothelium=Endothelium_markergenes), seed = 1)
+
+pdf(file='incisor_ATAC_markergenes_knowncelltypes.pdf', height=8.5, width=11.5)
+for (val in x){
+e1 <- plotEmbedding(project, name=paste('Module', gsub(' ', '', val), sep='.'), imputeWeights = getImputeWeights(project), embedding='UMAP_Combined')
+f1<-plotGroups(ArchRProj=project, groupBy="Clusters", name=paste('Module', gsub(' ', '', val), sep='.'), PlotAs="ridges")
+print(p3 + e1 + f1)
+}
+dev.off()
+
+
+###############now assess marker genes
+project<-addImputeWeights(project, reducedDims="LSI_Combined")
+standardmarkers<-c('PITX1', 'BARX1', 'BARX2', 'SHH', 'WNT10A', 'WIF1', 'PITX2', 'FCER1G', 'HBA1', 'LEF1', 'ENG', 'TP63', 'SOX9', 'EPCAM', 'SOX10', 'CDH5', 'ELAVL3', 'WNT5A', 'WNT3A', 'ACTA2', 'NEBL', 'FOXD1', 'SBSN', 'IVL')
+load(file='/home/FCAM/ewentworth/cotney/one2one_ortho.Rdata') #stored as genesV2
+standardmarkers<-genesV2[which(genesV2$HGNC.symbol %in% standardmarkers),2]
+standardmarkers<-intersect(standardmarkers, getFeatures(project))
+
+heatmapGS <- markerHeatmap(seMarker = markergenes, cutOff = "FDR <= 0.01 & Log2FC >= 1.25", labelMarkers = standardmarkers, transpose = TRUE)
+pdf(file="incisors_standardmarkers_heatmap.pdf", height=25, width=15)
+ComplexHeatmap::draw(heatmapGS, heatmap_legend_side = "bot", annotation_legend_side = "bot")
+dev.off()
+pdf(file="incisors_standardmarkers_umap.pdf", height=25, width=15)
+p <- plotEmbedding(ArchRProj = project, colorBy = "GeneExpressionMatrix", name = standardmarkers, embedding = "UMAP_Combined", quantCut = c(0.01, 0.95), imputeWeights = getImputeWeights(project), threads=1)
+p2 <- lapply(p, function(x){
+    x + guides(color = FALSE, fill = FALSE) + theme_ArchR(baseSize = 6.5) + theme(plot.margin = unit(c(0, 0, 0, 0), "cm")) + theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(), axis.text.y=element_blank(),axis.ticks.y=element_blank())
+})
+do.call(cowplot::plot_grid, c(list(ncol = 3),p2))
+p <- plotEmbedding(ArchRProj = project, colorBy = "GeneScoreMatrix", name = standardmarkers, embedding = "UMAP_Combined", quantCut = c(0.01, 0.95), imputeWeights = getImputeWeights(project), threads=1)
+p2 <- lapply(p, function(x){
+    x + guides(color = FALSE, fill = FALSE) + theme_ArchR(baseSize = 6.5) +theme(plot.margin = unit(c(0, 0, 0, 0), "cm")) +theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(), axis.text.y=element_blank(), axis.ticks.y=element_blank())
+})
+do.call(cowplot::plot_grid, c(list(ncol = 3),p2))
+p <- plotGroups(ArchRProj = project, groupBy='Clusters', colorBy='GeneScoreMatrix', name = standardmarkers, imputeWeights = getImputeWeights(project), PlotAs='ridges', threads=1)
+p2 <- lapply(p, function(x){
+    x + guides(color = FALSE, fill = FALSE) + theme_ArchR(baseSize = 6.5) + theme(plot.margin = unit(c(0, 0, 0, 0), "cm")) + theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(), axis.text.y=element_blank(), axis.ticks.y=element_blank())
+})
+do.call(cowplot::plot_grid, c(list(ncol = 3),p2))
+dev.off()
+
+pdf(file="incisor_vardeviations_sigmoid.pdf")
+getVarDeviations(project, name = "MotifMatrix", plot = TRUE)
+dev.off()
+
+markerMotifs <- getFeatures(project, useMatrix = "MotifMatrix")
+markerMotifs<-markerMotifs[grep('Sox|RUNX|Six|Lhx|Dlx|Hmx|Msx|Twist|Tcf', markerMotifs, ignore.case=TRUE)]
+markerMotifs<-markerMotifs[grep('z:', markerMotifs, ignore.case=TRUE)]
+markerMotifs<-gsub('z:', '', markerMotifs)
+motifPositions <- getPositions(project)
+seFoot <- getFootprints(ArchRProj = project, positions = motifPositions[markerMotifs], groupBy = "Clusters")
+pdf(file="incisors_footprinting.pdf")
+plotFootprints(seFoot = seFoot, ArchRProj = project, normMethod = "Subtract", plotName = "Footprints-Subtract-Bias", addDOC = FALSE, smoothWindow = 5)
+dev.off()
+
+saveArchRProject(project,  outputDirectory = getOutputDirectory(project),  overwrite = TRUE,  load = TRUE)
+
+project <- addCoAccessibility( ArchRProj = project, reducedDims = "LSI_Combined")
+saveArchRProject(project,  outputDirectory = getOutputDirectory(project),  overwrite = TRUE,  load = TRUE)
+
+cA <- getCoAccessibility( ArchRProj = project, corCutOff = 0.5, resolution = 1000, returnLoops = TRUE)
+markergenes<-c('Pitx2', 'Lef1', 'Wnt5a', 'Foxd1', 'Tp63', 'Cdkn1a',  'Shh', 'Msx1', 'Bmp4', 'Sox9', 'Wnt10a', 'Sox10', 'Wnt3a', 'Fgf10', 'Fgf8', 'Wif1')
+p<-plotBrowserTrack(ArchRProj = project, groupBy = "Clusters", useGroups=c('Mesenchyme', 'Epithelium', 'Perivascular Cells', 'Dental Mesenchyme', 'Keratinocytes', 'Enamel Knot', 'Dental Epithelium', 'Dental Papilla', 'Periderm', 'Dental Follicle'), features=GRanges(enhancers), geneSymbol = markergenes, upstream = 100000, downstream = 100000, loops = getCoAccessibility(project))
+pdf(file="CF_only_browsershot_coaccessibility.pdf")
+for (genename in markergenes){
+print(grid::grid.newpage())
+print(grid::grid.draw(p[[genename]]))
+}
+dev.off()
+
+project <- addPeak2GeneLinks(ArchRProj = project, addEmpiricalPval = TRUE, reducedDims = "LSI_Combined", useMatrix='GeneScoreMatrix', maxDist = 2500000)
+
+xxy<-unique(project$Clusters)
+enhancers<-NULL
+for (filename in xxy){
+print(filename)
+enh2<-read.table(file=paste('~/cotney/rawdata/chromatinsegmentations/mouse_atac/mm10_', gsub(" ", ".", filename), "_incisors_celltypespecificenhancers.bed", sep=""), sep='\t')
+colnames(enh2)<-c('chr', 'start', 'end', 'peak')
+enh2$peak<-filename
+enhancers<-rbind(enhancers, enh2)
+}
+enhancers<-bedr(input=list(i=enhancers), method='sort', verbose=F)
+enhancers2<-read.table('/home/FCAM/ewentworth/cotney/rawdata/chromatinsegmentations/mouse_18state/tissue_specific_enhancer_analysis/tooth_all_enhancers.bed', sep='\t')
+test<-bedr(engine='bedtools', input=list(a=enhancers, b=enhancers2), method='intersect', params='-sorted -wo', verbose=F)
+table(enhancers$peak)
+table(test$peak)
+
+p<-plotBrowserTrack( ArchRProj = project, groupBy = "Clusters", useGroups=c('Mesenchyme', 'Epithelium', 'Perivascular Cells', 'Dental Mesenchyme', 'Keratinocytes', 'Enamel Knot', 'Dental Epithelium', 'Dental Papilla', 'Periderm', 'Dental Follicle'), features=GRanges(enhancers), geneSymbol = markergenes, upstream = 350000, downstream = 5000, loops = getPeak2GeneLinks(project, corCutOff=0.5, resolution=5000))
+
+pdf(file="incisor_only_browsershot_peak2genelinks.pdf")
+for (genename in markergenes){
+print(grid::grid.newpage())
+print(grid::grid.draw(p[[genename]]))
+}
+dev.off()
+
+project <- addBgdPeaks(project)
+project <- addDeviationsMatrix( ArchRProj = project, peakAnnotation = "EncodeTFBS", force = TRUE, threads=16)
+
+seGroupMotif <- getGroupSE(ArchRProj = project, useMatrix = "MotifMatrix", groupBy = "Clusters")
+corGSM_MM <- correlateMatrices(ArchRProj = project, useMatrix1 = "GeneScoreMatrix", useMatrix2 = "MotifMatrix", reducedDims = "LSI_Combined")
+seZ <- seGroupMotif[rowData(seGroupMotif)$seqnames=="z",]
+rowData(seZ)$maxDelta <- lapply(seq_len(ncol(seZ)), function(x){
+  rowMaxs(assay(seZ) - assay(seZ)[,x])
+}) %>% Reduce("cbind", .) %>% rowMaxs
+corGSM_MM$maxDelta <- rowData(seZ)[match(corGSM_MM$MotifMatrix_name, rowData(seZ)$name), "maxDelta"]
+corGSM_MM$maxDelta <- rowData(seZ)[match(corGSM_MM$MotifMatrix_name, rowData(seZ)$name), "maxDelta"]
+corGSM_MM <- corGSM_MM[order(abs(corGSM_MM$cor), decreasing = TRUE), ]
+corGSM_MM <- corGSM_MM[which(!duplicated(gsub("\\-.*","",corGSM_MM[,"MotifMatrix_name"]))), ]
+corGSM_MM$TFRegulator <- "NO"
+corGSM_MM$TFRegulator[which(corGSM_MM$cor > 0.5 & corGSM_MM$padj < 0.05 & corGSM_MM$maxDelta > quantile(corGSM_MM$maxDelta, 0.5))] <- "YES"
+sort(corGSM_MM[corGSM_MM$TFRegulator=="YES",1])
+corGSM_MM<-data.frame(corGSM_MM)
+pdf(file='incisor_covariance.pdf')
+ggplot(data.frame(corGSM_MM), aes(cor, maxDelta, color = TFRegulator, label=TFRegulator)) +  geom_point() + theme_ArchR() + geom_vline(xintercept = 0, lty = "dashed") + scale_color_manual(values = c("NO"="darkgrey", "YES"="firebrick3")) + xlab("Correlation To Gene Score") + ylab("Max TF Motif Delta") + scale_y_continuous(expand = c(0,0), limits = c(0, max(corGSM_MM$maxDelta)*1.05)) + geom_label_repel(data=corGSM_MM[corGSM_MM$TFRegulator=="YES",], aes(x=cor, y=maxDelta, label=GeneScoreMatrix_name)) 
+dev.off()
+seGroupMotif <- getGroupSE(ArchRProj = project, useMatrix = "MotifMatrix", groupBy = "Clusters")
+corGSM_MM <- correlateMatrices(ArchRProj = project, useMatrix1 = "GeneExpressionMatrix", useMatrix2 = "MotifMatrix", reducedDims = "LSI_Combined")
+seZ <- seGroupMotif[rowData(seGroupMotif)$seqnames=="z",]
+rowData(seZ)$maxDelta <- lapply(seq_len(ncol(seZ)), function(x){
+  rowMaxs(assay(seZ) - assay(seZ)[,x])
+}) %>% Reduce("cbind", .) %>% rowMaxs
+corGSM_MM$maxDelta <- rowData(seZ)[match(corGSM_MM$MotifMatrix_name, rowData(seZ)$name), "maxDelta"]
+corGSM_MM$maxDelta <- rowData(seZ)[match(corGSM_MM$MotifMatrix_name, rowData(seZ)$name), "maxDelta"]
+corGSM_MM <- corGSM_MM[order(abs(corGSM_MM$cor), decreasing = TRUE), ]
+corGSM_MM <- corGSM_MM[which(!duplicated(gsub("\\-.*","",corGSM_MM[,"MotifMatrix_name"]))), ]
+corGSM_MM$TFRegulator <- "NO"
+corGSM_MM$TFRegulator[which(corGSM_MM$cor > 0.5 & corGSM_MM$padj < 0.05 & corGSM_MM$maxDelta > quantile(corGSM_MM$maxDelta, 0.5))] <- "YES"
+sort(corGSM_MM[corGSM_MM$TFRegulator=="YES",1])
+corGSM_MM<-data.frame(corGSM_MM)
+pdf(file='incisor_covariance_geneexpression.pdf')
+ggplot(data.frame(corGSM_MM), aes(cor, maxDelta, color = TFRegulator, label=TFRegulator)) +  geom_point() + theme_ArchR() + geom_vline(xintercept = 0, lty = "dashed") + scale_color_manual(values = c("NO"="darkgrey", "YES"="firebrick3")) + xlab("Correlation To Gene Score") + ylab("Max TF Motif Delta") + scale_y_continuous(expand = c(0,0), limits = c(0, max(corGSM_MM$maxDelta)*1.05)) + geom_label_repel(data=corGSM_MM[corGSM_MM$TFRegulator=="YES",], aes(x=cor, y=maxDelta, label=GeneScoreMatrix_name)) 
+dev.off()
+
+saveArchRProject(project)
+
+
+
+
+project <- addBgdPeaks(project)
+project <- addDeviationsMatrix( ArchRProj = project, peakAnnotation = "EncodeTFBS", force = TRUE, threads=16)
+saveArchRProject(project)
+
+dev.off()
+
+#lhx6, tfap2b label dental mesenchyme
+#pax9, epha3, fxyd7, foxd1 are for dental follicle
+#crym, egr3, fgf3 are dental papilla
+
+trajectory<-c('Dental Mesenchyme', 'Dental Papilla')
+project <- addTrajectory( ArchRProj = project, name = "Mesenchyme", groupBy = "Clusters", trajectory = trajectory, embedding = "UMAP_Combined", force = TRUE)
+p <- plotTrajectory(project, trajectory = "Mesenchyme", colorBy = "cellColData", name = "Mesenchyme", embedding='UMAP_Combined')
+p1 <- plotTrajectory(project, trajectory = "Mesenchyme", colorBy = "GeneExpressionMatrix", name = "Runx2", continuousSet = "horizonExtra", embedding='UMAP_Combined')
+p2 <- plotTrajectory(project, trajectory = "Mesenchyme", colorBy = "GeneExpressionMatrix", name = "Foxd1", continuousSet = "horizonExtra", embedding='UMAP_Combined')
+p3 <- plotTrajectory(project, trajectory = "Mesenchyme", colorBy = "GeneExpressionMatrix", name = "Fgf3", continuousSet = "horizonExtra", embedding='UMAP_Combined')
+p8<- plotTrajectory(project, trajectory = "Mesenchyme", colorBy = "GeneExpressionMatrix", name = "Wif1", continuousSet = "horizonExtra", embedding='UMAP_Combined')
+p9<- plotTrajectory(project, trajectory = "Mesenchyme", colorBy = "GeneExpressionMatrix", name = "Egr3", continuousSet = "horizonExtra", embedding='UMAP_Combined')
+p5 <- plotTrajectory(project, trajectory = "Mesenchyme", colorBy = "MotifMatrix", name = "z:Twist2_48", continuousSet = "horizonExtra", embedding='UMAP_Combined')
+p6 <- plotTrajectory(project, trajectory = "Mesenchyme", colorBy = "MotifMatrix", name = "z:Foxf1_89", continuousSet = "horizonExtra", embedding='UMAP_Combined')
+p7 <- plotTrajectory(project, trajectory = "Mesenchyme", colorBy = "MotifMatrix", name = "z:RUNX1_12", continuousSet = "horizonExtra", embedding='UMAP_Combined')
+p4<-plotEmbedding(ArchRProj=project, colorBy="cellColData", name="Clusters", embedding="UMAP_Combined")+ theme(text = element_text(size=20), aspect.ratio=1)
+p10 <- plotTrajectory(project, trajectory = "Mesenchyme", colorBy = "GeneExpressionMatrix", name = "Sall1", continuousSet = "horizonExtra", embedding='UMAP_Combined')
+p11 <- plotTrajectory(project, trajectory = "Mesenchyme", colorBy = "GeneExpressionMatrix", name = "Gsc", continuousSet = "horizonExtra", embedding='UMAP_Combined')
+p12<- plotTrajectory(project, trajectory = "Mesenchyme", colorBy = "GeneExpressionMatrix", name = "Nupr1", continuousSet = "horizonExtra", embedding='UMAP_Combined')
+p13<- plotTrajectory(project, trajectory = "Mesenchyme", colorBy = "GeneExpressionMatrix", name = "Etv5", continuousSet = "horizonExtra", embedding='UMAP_Combined')
+
+pdf(file='Mesenchyme_trajectory.pdf', height=15, width=15)
+(p4|p[[1]])/(p1[[1]]|p2[[1]]|p3[[1]])/(p7[[1]]|p6[[1]]|p5[[1]])
+(p1[[2]]|p2[[2]])/(p3[[2]]|p8[[2]]|p9[[2]])
+p5[[2]]|p6[[2]]|p7[[2]]
+(p10[[2]]|p11[[2]])/(p12[[2]]|p13[[2]])
+dev.off()
+
+trajMM  <- getTrajectory(ArchRProj = project, name = "Mesenchyme", useMatrix = "MotifMatrix", log2Norm = FALSE)
+trajGSM  <- getTrajectory(ArchRProj = project, name = "Mesenchyme", useMatrix = "GeneScoreMatrix", log2Norm = FALSE)
+trajPM  <- getTrajectory(ArchRProj = project, name = "Mesenchyme", useMatrix = "PeakMatrix", log2Norm = FALSE)
+trajGEM<- getTrajectory(ArchRProj = project, name = "Mesenchyme", useMatrix = "GeneExpressionMatrix", log2Norm = FALSE)
+
+pdf(file='Mesenchyme_trajectory_heatmap.pdf', height=11, width=8.5)
+plotTrajectoryHeatmap(trajMM, pal = paletteContinuous(set = "solarExtra"))
+plotTrajectoryHeatmap(trajGEM, pal = paletteContinuous(set = "solarExtra"))
+plotTrajectoryHeatmap(trajPM, pal = paletteContinuous(set = "solarExtra"))
+plotTrajectoryHeatmap(trajGSM, pal = paletteContinuous(set = "solarExtra"))
+dev.off()
+
+corGSM_MM <- correlateTrajectories(trajGEM, trajMM)
+corGSM_MM[[1]]
+trajGSM2 <- trajGEM[corGSM_MM[[1]]$name1, ]
+trajMM2 <- trajMM[corGSM_MM[[1]]$name2, ]
+trajCombined <- trajGSM2
+assay(trajCombined) <- t(apply(assay(trajGSM2), 1, scale)) + t(apply(assay(trajMM2), 1, scale))
+combinedMat <- plotTrajectoryHeatmap(trajCombined, returnMat = TRUE, varCutOff = 0)
+rowOrder <- match(rownames(combinedMat), rownames(trajGSM2))
+ht1 <- plotTrajectoryHeatmap(trajGSM2,  pal = paletteContinuous(set = "horizonExtra"),  varCutOff = 0, rowOrder = rowOrder)
+ht2 <- plotTrajectoryHeatmap(trajMM2, pal = paletteContinuous(set = "solarExtra"), varCutOff = 0, rowOrder = rowOrder)
+pdf(file='Mesenchyme_trajectory_motif_geneexpression_correlation_heatmap.pdf', height=8.5, width=11)
+ht1 + ht2
+dev.off()
+corGSM_MM <- correlateTrajectories(trajGEM, trajGSM)
+corGSM_MM[[1]]
+trajGSM2 <- trajGEM[corGSM_MM[[1]]$name1, ]
+trajMM2 <- trajGSM[corGSM_MM[[1]]$name2, ]
+trajCombined <- trajGSM2
+combinedMat <- plotTrajectoryHeatmap(trajCombined, returnMat = TRUE, varCutOff = 0)
+rowOrder <- match(rownames(combinedMat), rownames(trajGSM2))
+ht1 <- plotTrajectoryHeatmap(trajGSM2,  pal = paletteContinuous(set = "horizonExtra"),  varCutOff = 0, rowOrder = rowOrder)
+ht2 <- plotTrajectoryHeatmap(trajMM2, pal = paletteContinuous(set = "solarExtra"), varCutOff = 0, rowOrder = rowOrder)
+pdf(file='Mesenchyme_trajectory_genescore_geneexpression_correlation_heatmap.pdf', height=8.5, width=11)
+ht1 + ht2
+dev.off()
+
+
+
+
+
+
+trajectory<-c('Dental Epithelium', 'Enamel Knot')
+project <- addTrajectory( ArchRProj = project, name = "EnamelKnot", groupBy = "Clusters", trajectory = trajectory, embedding = "UMAP_Combined", force = TRUE)
+p <- plotTrajectory(project, trajectory = "EnamelKnot", colorBy = "cellColData", name = "EnamelKnot", embedding='UMAP_Combined')
+p1 <- plotTrajectory(project, trajectory = "EnamelKnot", colorBy = "GeneExpressionMatrix", name = "Bmp4", continuousSet = "horizonExtra", embedding='UMAP_Combined')
+p2 <- plotTrajectory(project, trajectory = "EnamelKnot", colorBy = "GeneExpressionMatrix", name = "Shh", continuousSet = "horizonExtra", embedding='UMAP_Combined')
+p3 <- plotTrajectory(project, trajectory = "EnamelKnot", colorBy = "GeneExpressionMatrix", name = "Wnt10a", continuousSet = "horizonExtra", embedding='UMAP_Combined')
+p5 <- plotTrajectory(project, trajectory = "EnamelKnot", colorBy = "MotifMatrix", name = "z:Twist2_48", continuousSet = "horizonExtra", embedding='UMAP_Combined')
+p6 <- plotTrajectory(project, trajectory = "EnamelKnot", colorBy = "MotifMatrix", name = "z:Foxf1_89", continuousSet = "horizonExtra", embedding='UMAP_Combined')
+p7 <- plotTrajectory(project, trajectory = "EnamelKnot", colorBy = "MotifMatrix", name = "z:RUNX1_12", continuousSet = "horizonExtra", embedding='UMAP_Combined')
+p4<-plotEmbedding(ArchRProj=project, colorBy="cellColData", name="Clusters", embedding="UMAP_Combined")+ theme(text = element_text(size=20), aspect.ratio=1)
+p10 <- plotTrajectory(project, trajectory = "Mesenchyme", colorBy = "GeneExpressionMatrix", name = "Wif1", continuousSet = "horizonExtra", embedding='UMAP_Combined')
+p11 <- plotTrajectory(project, trajectory = "Mesenchyme", colorBy = "GeneExpressionMatrix", name = "Pitx2", continuousSet = "horizonExtra", embedding='UMAP_Combined')
+p12<- plotTrajectory(project, trajectory = "Mesenchyme", colorBy = "GeneExpressionMatrix", name = "Wnt10b", continuousSet = "horizonExtra", embedding='UMAP_Combined')
+p13<- plotTrajectory(project, trajectory = "Mesenchyme", colorBy = "GeneExpressionMatrix", name = "Agap1", continuousSet = "horizonExtra", embedding='UMAP_Combined')
+p10b <- plotTrajectory(project, trajectory = "Mesenchyme", colorBy = "GeneScoreMatrix", name = "Wif1", continuousSet = "horizonExtra", embedding='UMAP_Combined')
+p11b <- plotTrajectory(project, trajectory = "Mesenchyme", colorBy = "GeneScoreMatrix", name = "Pitx2", continuousSet = "horizonExtra", embedding='UMAP_Combined')
+p12b<- plotTrajectory(project, trajectory = "Mesenchyme", colorBy = "GeneScoreMatrix", name = "Wnt10b", continuousSet = "horizonExtra", embedding='UMAP_Combined')
+p13b<- plotTrajectory(project, trajectory = "Mesenchyme", colorBy = "GeneScoreMatrix", name = "Agap1", continuousSet = "horizonExtra", embedding='UMAP_Combined')
+pdf(file='EnamelKnot_trajectory.pdf', height=8.5, width=11)
+(p4|p[[1]])/(p1[[1]]|p2[[1]]|p3[[1]])
+p1[[2]]|p2[[2]]|p3[[2]]
+p5[[2]]|p6[[2]]|p7[[2]]
+(p10[[2]]|p11[[2]])/(p12[[2]]|p13[[2]])
+(p10b[[2]]|p11b[[2]])/(p12b[[2]]|p13b[[2]])
+dev.off()
+
+trajMM  <- getTrajectory(ArchRProj = project, name = "EnamelKnot", useMatrix = "MotifMatrix", log2Norm = FALSE)
+trajGEM  <- getTrajectory(ArchRProj = project, name = "EnamelKnot", useMatrix = "GeneExpressionMatrix", log2Norm = FALSE)
+trajPM  <- getTrajectory(ArchRProj = project, name = "EnamelKnot", useMatrix = "PeakMatrix", log2Norm = FALSE)
+trajGSM  <- getTrajectory(ArchRProj = project, name = "EnamelKnot", useMatrix = "GeneScoreMatrix", log2Norm = FALSE)
+
+pdf(file='EnamelKnot_trajectory_heatmap.pdf', height=8.5, width=11)
+plotTrajectoryHeatmap(trajMM, varCutOff = 0.75, pal = paletteContinuous(set = "solarExtra"))
+plotTrajectoryHeatmap(trajGEM, varCutOff = 0.75, pal = paletteContinuous(set = "solarExtra"))
+plotTrajectoryHeatmap(trajPM, varCutOff = 0.75, pal = paletteContinuous(set = "solarExtra"))
+plotTrajectoryHeatmap(trajGSM, varCutOff = 0.75, pal = paletteContinuous(set = "solarExtra"))
+dev.off()
+
+corGSM_MM <- correlateTrajectories(trajGEM, trajMM)
+corGSM_MM[[1]]
+trajGSM2 <- trajGEM[corGSM_MM[[1]]$name1, ]
+trajMM2 <- trajMM[corGSM_MM[[1]]$name2, ]
+trajCombined <- trajGSM2
+assay(trajCombined) <- t(apply(assay(trajGSM2), 1, scale)) + t(apply(assay(trajMM2), 1, scale))
+combinedMat <- plotTrajectoryHeatmap(trajCombined, returnMat = TRUE, varCutOff = 0)
+rowOrder <- match(rownames(combinedMat), rownames(trajGSM2))
+ht1 <- plotTrajectoryHeatmap(trajGSM2,  pal = paletteContinuous(set = "horizonExtra"),  varCutOff = 0, rowOrder = rowOrder)
+ht2 <- plotTrajectoryHeatmap(trajMM2, pal = paletteContinuous(set = "solarExtra"), varCutOff = 0, rowOrder = rowOrder)
+pdf(file='EnamelKnot_trajectory_motif_geneexpression_correlation_heatmap.pdf', height=8.5, width=11)
+ht1 + ht2
+dev.off()
+corGSM_MM <- correlateTrajectories(trajGEM, trajGSM)
+corGSM_MM[[1]]
+trajGSM2 <- trajGEM[corGSM_MM[[1]]$name1, ]
+trajMM2 <- trajGSM[corGSM_MM[[1]]$name2, ]
+trajCombined <- trajGSM2
+combinedMat <- plotTrajectoryHeatmap(trajCombined, returnMat = TRUE, varCutOff = 0)
+rowOrder <- match(rownames(combinedMat), rownames(trajGSM2))
+ht1 <- plotTrajectoryHeatmap(trajGSM2,  pal = paletteContinuous(set = "horizonExtra"),  varCutOff = 0, rowOrder = rowOrder)
+ht2 <- plotTrajectoryHeatmap(trajMM2, pal = paletteContinuous(set = "solarExtra"), varCutOff = 0, rowOrder = rowOrder)
+pdf(file='EnamelKnot_trajectory_genescore_geneexpression_correlation_heatmap.pdf', height=8.5, width=11)
+ht1 + ht2
+dev.off()
+
+
+
+saveArchRProject(project)
+
+
+
+
+
+list<-list.files(path='/home/FCAM/ewentworth/cotney/analysis/scatac/incisor_multiome/tooth/PeakCalls/', pattern='Peaks.gr.rds')
+list1<-list[grep(paste(gsub(' ', '.', unique(project$Clusters)), collapse='|'), list)]
+list<-paste("/home/FCAM/ewentworth/cotney/analysis/scatac/incisor_multiome/tooth/PeakCalls/", list1, sep="")
+for (filename in list){
+val<-as.data.frame(readRDS(file=filename))
+bed<-val[,c(1,2,3,4,6,5,6,9,10,11)]
+bed[,c('Reproducibility', 'GroupReplicate', 'distToGeneStart')]<-bed$score
+list1<-gsub('/home/FCAM/ewentworth/cotney/analysis/scatac/incisor_multiome/tooth/PeakCalls/|-reproduciblePeaks.gr.rds', '', filename)
+print(filename)
+print(dim(bed))
+write.table(bed, file=paste('/home/FCAM/ewentworth/cotney/analysis/abcenhancer/tooth/', list1, ".bed", sep=''), sep='\t', quote=F, col.names=F, row.names=F)
+assign(list1, val)
+}
+
+
+
+
+pdf(file='RUIZ_mainfigure.pdf', height=20, width=20)
+a<-plotEmbedding(ArchRProj = project, colorBy = "GeneExpressionMatrix", name = 'Edar', embedding = "UMAP_Combined", quantCut = c(0.01, 0.95), imputeWeights = getImputeWeights(project), threads=1)
+b<-plotEmbedding(ArchRProj = project, colorBy = "GeneExpressionMatrix", name = 'Pitx1', embedding = "UMAP_Combined", quantCut = c(0.01, 0.95), imputeWeights = getImputeWeights(project), threads=1)
+c<-plotEmbedding(ArchRProj = project, colorBy = "GeneExpressionMatrix", name = 'Hs3st3b1', embedding = "UMAP_Combined", quantCut = c(0.01, 0.95), imputeWeights = getImputeWeights(project), threads=1)
+d<-plotEmbedding(ArchRProj = project, colorBy = "GeneExpressionMatrix", name = 'Shh', embedding = "UMAP_Combined", quantCut = c(0.01, 0.95), imputeWeights = getImputeWeights(project), threads=1)
+e<-plotGroups(ArchRProj=project, groupBy="Clusters", colorBy='GeneExpressionMatrix', name = 'Edar', imputeWeights = getImputeWeights(project), PlotAs='ridges', threads=1)
+f<-plotGroups(ArchRProj=project, groupBy="Clusters", colorBy='GeneExpressionMatrix', name = 'Pitx1', imputeWeights = getImputeWeights(project), PlotAs='ridges', threads=1)
+g<-plotGroups(ArchRProj=project, groupBy="Clusters", colorBy='GeneExpressionMatrix', name = 'Hs3st3b1', imputeWeights = getImputeWeights(project), PlotAs='ridges', threads=1)
+h<-plotGroups(ArchRProj=project, groupBy="Clusters", colorBy='GeneExpressionMatrix', name = 'Shh', imputeWeights = getImputeWeights(project), PlotAs='ridges', threads=1)
+
+a
+b
+c
+d
+e
+f
+g
+h
+dev.off()
